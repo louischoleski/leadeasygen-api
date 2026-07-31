@@ -6,6 +6,8 @@
 	"type": "module",
 	"scripts": {
 		"dev": "tsx watch src/index.ts",
+		"worker": "tsx src/worker.ts",
+		"worker:dev": "tsx watch src/worker.ts",
 		"build": "tsup src/index.ts --format esm --dts",
 		"start": "node dist/index.js"
 	},
@@ -16,11 +18,15 @@
 		"@fonderie/events": "*",
 		"@fonderie/store": "*",
 		"@fonderie/workspaces": "*",
-		"express": "^4.21.2"
+		"axios": "^1.19.0",
+		"dotenv": "^17.4.2",
+		"express": "^4.21.2",
+		"stripe": "^22.4.0"
 	},
 	"devDependencies": {
 		"@types/express": "^4.17.21",
 		"@types/node": "^22.10.2",
+		"playwright": "^1.40.0",
 		"tsup": "^8.3.5",
 		"tsx": "^4.19.2",
 		"typescript": "^5.6.3"
