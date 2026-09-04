@@ -2,6 +2,7 @@ import type { Express, Request, Response } from 'express';
 import type { IStoreAdapter } from '@fonderie/store/types';
 
 import { requireAuth } from '../auth/requireAuth.js';
+import { ensureMonthlyGrant } from '../credits/monthlyGrant.js';
 import { enqueueScrapeTask } from '../queue/scrapeQueue.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -121,12 +122,11 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 			limit = n;
 		}
 
-		// Fast fail using the credits attached to req.user by requireAuth.
-		if ((req.user!.credits ?? 0) < 1) {
-			return res.status(403).json({ error: 'Insufficient credits', balance: req.user!.credits });
-		}
-
 		try {
+			// Free-plan monthly credits may land right here (first activity of the
+			// month), so the balance check below must read the ledger — the
+			// credits cached on req.user by requireAuth predate the grant.
+			await ensureMonthlyGrant(store, userId);
 			// Authoritative balance check (from the ledger) + task insert, in one
 			// transaction. No deduction here — the credit is charged on completion
 			// by the worker, so a failed scrape never costs the user anything.
@@ -179,6 +179,7 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 		const userId = req.user!.id;
 
 		try {
+			await ensureMonthlyGrant(store, userId);
 			const outcome = await store.transaction(async (tx) => {
 				const rows = await tx.query<Pick<TaskRow, 'id' | 'url' | 'limit' | 'status' | 'params'> & { superseded_by: string | null }>(
 					'SELECT id, url, "limit", status, params, superseded_by FROM scrape_tasks WHERE id = $1 AND user_id = $2',

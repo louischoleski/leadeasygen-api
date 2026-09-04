@@ -3,6 +3,7 @@ import type Stripe from 'stripe';
 import type { IStoreAdapter } from '@fonderie/store/types';
 
 import { requireAuth } from '../auth/requireAuth.js';
+import { ensureMonthlyGrant } from './monthlyGrant.js';
 import { isPack, type Pack, type PackDef } from './packs.js';
 
 interface CreditRoutesConfig {
@@ -142,6 +143,9 @@ export function registerCreditRoutes(
 	// (source of truth). fonderie_users.credits is only a cache.
 	app.get('/v1/credits/balance', ...requireAuth(store), async (req: Request, res: Response) => {
 		try {
+			// Free-plan monthly credits land lazily on the first balance read of
+			// the month (which for a fresh signup is the first dashboard load).
+			await ensureMonthlyGrant(store, req.user!.id);
 			const rows = await store.query<{ balance: number }>(
 				'SELECT COALESCE(SUM(amount), 0)::int AS balance FROM credit_transactions WHERE user_id = $1',
 				[req.user!.id],
@@ -156,6 +160,7 @@ export function registerCreditRoutes(
 	// GET /v1/credits/transactions — the user's ledger (most recent 50).
 	app.get('/v1/credits/transactions', ...requireAuth(store), async (req: Request, res: Response) => {
 		try {
+			await ensureMonthlyGrant(store, req.user!.id);
 			const rows = await store.query<{
 				id: string;
 				task_id: string | null;
