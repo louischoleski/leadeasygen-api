@@ -139,9 +139,15 @@ export async function scrapeGoogleMaps(input: { url: string; limit?: number }): 
 		const feed = page.locator('div[role="feed"]');
 		let urls: string[] = [];
 
-		if (await feed.count().then((n) => n > 0).catch(() => false)) {
-			await feed.first().waitFor({ state: 'visible', timeout: SELECTOR_TIMEOUT_MS });
+		// The feed hydrates well after domcontentloaded — wait for it to appear
+		// rather than sampling the pre-render DOM (which always counts zero).
+		const hasFeed = await feed
+			.first()
+			.waitFor({ state: 'visible', timeout: SELECTOR_TIMEOUT_MS })
+			.then(() => true)
+			.catch(() => false);
 
+		if (hasFeed) {
 			// Scroll the feed until the end-of-list marker appears, the result
 			// count stops growing, or we've collected enough to satisfy `cap`.
 			let previousCount = -1;
