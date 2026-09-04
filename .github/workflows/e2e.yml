@@ -1,0 +1,64 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  api-e2e:
+    name: API e2e (MFA)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: leadeasygen
+          POSTGRES_PASSWORD: leadeasygen
+          POSTGRES_DB: leadeasygen_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U leadeasygen -d leadeasygen_dev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://leadeasygen:leadeasygen@localhost:5432/leadeasygen_dev
+      # 32+ chars so auth boots without the insecure-secret warning.
+      JWT_SECRET: ci-e2e-jwt-secret-please-change-in-prod-0001
+      # SMTP intentionally unset — the MFA spec reads pins from the DB, so email
+      # delivery isn't needed and courier stays disabled.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # API tests use Playwright's request fixture only — no browser download.
+      - name: Start API, wait for health, run e2e
+        run: |
+          npm run dev > api.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:3000/health && break; sleep 2; done
+          curl -sf http://localhost:3000/health || { echo "API failed to start"; cat api.log; exit 1; }
+          npm run test:e2e
+
+      - name: API log on failure
+        if: failure()
+        run: cat api.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
