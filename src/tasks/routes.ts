@@ -121,7 +121,8 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 			limit = n;
 		}
 
-		// Fast fail using the credits attached to req.user by requireAuth.
+		// Fast fail using the credits attached to req.user by requireAuth
+		// (already inclusive of any just-applied monthly grant).
 		if ((req.user!.credits ?? 0) < 1) {
 			return res.status(403).json({ error: 'Insufficient credits', balance: req.user!.credits });
 		}

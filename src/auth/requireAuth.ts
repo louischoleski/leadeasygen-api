@@ -6,6 +6,8 @@ import {
 } from '@fonderie/adapter-express';
 import type { IStoreAdapter } from '@fonderie/store/types';
 
+import { ensureMonthlyGrant } from '../credits/monthlyGrant.js';
+
 /** The current user attached to the request after `requireAuth`. */
 export interface AuthedUser {
 	id: string;
@@ -54,6 +56,12 @@ function attachUser(store: IStoreAdapter) {
 		}
 
 		try {
+			// The free plan's monthly credits apply lazily on any authenticated
+			// request — before the user row is read, so `req.user.credits`
+			// already includes a fresh grant. Non-fatal on error: the next
+			// request retries, and a broken database fails the SELECT below.
+			await ensureMonthlyGrant(store, userId).catch(() => undefined);
+
 			const rows = await store.query<UserRow>(
 				'SELECT id, email, display_name, credits, created_at FROM fonderie_users WHERE id = $1 AND deleted_at IS NULL',
 				[userId],
