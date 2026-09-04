@@ -117,7 +117,9 @@ async function main() {
 			),
 		);
 
-		if (notifyBus) {
+		// Guard on smtpHost (not notifyBus) so its type narrows to string below;
+		// the two are truthy together, since notifyBus is set iff smtpHost is.
+		if (smtpHost) {
 			// Every auth message type routed to the email channel. Courier skips any
 			// whose recipient has no email address (e.g. phone-only OTP).
 			const emailOnly = ['email'] as const;
