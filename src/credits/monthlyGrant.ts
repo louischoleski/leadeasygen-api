@@ -3,9 +3,9 @@ import type { IStoreAdapter } from '@fonderie/store/types';
 /**
  * The free ($0/month) plan every account starts on: 50 credits granted per
  * calendar month. There is no signup hook — the grant is applied lazily,
- * exactly once per month, whenever an authenticated user touches a credits
- * path (balance read, task create/retry). A brand-new account therefore
- * receives its first 50 credits the moment the dashboard loads.
+ * exactly once per month, by the requireAuth middleware on any authenticated
+ * request. A brand-new account therefore receives its first 50 credits the
+ * moment the dashboard loads, and no route has to remember to grant.
  */
 export const FREE_MONTHLY_CREDITS = 50;
 
