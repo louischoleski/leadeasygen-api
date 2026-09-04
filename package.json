@@ -15,12 +15,14 @@
 		"@fonderie/adapter-express": "*",
 		"@fonderie/auth": "*",
 		"@fonderie/core": "*",
+		"@fonderie/courier": "^5.0.0",
 		"@fonderie/events": "*",
 		"@fonderie/store": "*",
 		"@fonderie/workspaces": "*",
 		"axios": "^1.19.0",
 		"dotenv": "^17.4.2",
 		"express": "^4.21.2",
+		"nodemailer": "^9.1.1",
 		"stripe": "^22.4.0"
 	},
 	"devDependencies": {

@@ -4,6 +4,9 @@ import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
 import { getMigrationsPath as authMigrationsPath } from '@fonderie/auth/migrations';
 import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migrations';
+import { EventsModule, MemoryTransport } from '@fonderie/events';
+import { CourierModule } from '@fonderie/courier';
+import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
 import { mount } from '@fonderie/adapter-express';
 import express from 'express';
 import Stripe from 'stripe';
@@ -56,6 +59,10 @@ async function main() {
 		await new InternalMigrationRunner(store, authMigrationsPath()).run();
 		await new InternalMigrationRunner(store, eventsMigrationsPath()).run();
 		await new InternalMigrationRunner(store, getAppMigrationsPath()).run();
+		// Courier owns message_logs + the seeded transactional templates that
+		// the auth notification types (email-verification, password-reset, …)
+		// are rendered from.
+		await new InternalMigrationRunner(store, courierMigrationsPath()).run();
 
 		// Stripe one-time credit packs (no subscriptions). Optional: without a
 		// secret key the credit routes simply aren't registered.
@@ -82,20 +89,73 @@ async function main() {
 		// hangs until the client times out. The Stripe webhook above is matched
 		// before the bridge middleware and uses express.raw, so it is unaffected.
 
+		// Transactional email via @fonderie/courier. Auth publishes a notification
+		// event (verification pin, password-reset pin, …) onto an EventBus; courier
+		// subscribes and renders+sends it over SMTP using the DB-seeded templates.
+		// Both modules must share ONE bus, so we own it here (in-process memory
+		// transport — notifications are fire-and-forget, no durability needed) and
+		// hand the same instance to auth and courier. Without SMTP_HOST we skip
+		// courier entirely and degrade gracefully: auth still records pins in the DB.
+		const smtpHost = process.env.SMTP_HOST;
+		const eventsModule = new EventsModule({ transport: new MemoryTransport() });
+		const notifyBus = smtpHost ? eventsModule.bus : undefined;
+
 		// Standard Fonderie auth mold: stateless JWT sessions, email provider.
 		// (Clerk is not a Fonderie brick; @fonderie/auth is the default.)
 		// Registers POST /auth/register, POST /auth/login, POST /auth/refresh,
 		// POST /auth/logout, GET /users (user.me), etc.
-		const fonderie = await new FonderieApp(defineConfig({ db: { url: databaseUrl } }))
-			.register(
-				new AuthModule(store, {
+		let fonderieApp = new FonderieApp(defineConfig({ db: { url: databaseUrl } })).register(
+			new AuthModule(
+				store,
+				{
 					jwtSecret: process.env.JWT_SECRET ?? 'dev-secret-change-me-min-32-chars-long',
 					appName: 'LeadEasyGen',
 					providers: ['email'],
 					requireVerification: false,
-				}),
-			)
-			.boot();
+				},
+				notifyBus,
+			),
+		);
+
+		if (notifyBus) {
+			// Every auth message type routed to the email channel. Courier skips any
+			// whose recipient has no email address (e.g. phone-only OTP).
+			const emailOnly = ['email'] as const;
+			fonderieApp = fonderieApp.register(eventsModule).register(
+				new CourierModule(
+					{
+						channels: {
+							'email-verification': [...emailOnly],
+							'email-registration': [...emailOnly],
+							'password-reset': [...emailOnly],
+							'email-changed': [...emailOnly],
+							'phone-changed': [...emailOnly],
+							'mfa-enabled': [...emailOnly],
+							'mfa-disabled': [...emailOnly],
+							'mfa-backup-codes-regenerated': [...emailOnly],
+						},
+						email: {
+							provider: 'smtp',
+							from: process.env.SMTP_FROM ?? process.env.SMTP_USER!,
+							smtp: {
+								host: smtpHost,
+								port: Number(process.env.SMTP_PORT ?? 587),
+								secure: process.env.SMTP_SECURE === 'true',
+								user: process.env.SMTP_USER!,
+								pass: process.env.SMTP_PASS!,
+							},
+						},
+						templates: { source: 'db' },
+					},
+					store,
+					notifyBus,
+				),
+			);
+		} else {
+			console.warn('⚠️  SMTP_HOST not set — transactional email disabled (pins recorded in DB only).');
+		}
+
+		const fonderie = await fonderieApp.boot();
 
 		// mount() wires body parsing, context (bridge), and the auth routes onto
 		// Express. bridge runs first, so custom routes added below see req._fonderie.
