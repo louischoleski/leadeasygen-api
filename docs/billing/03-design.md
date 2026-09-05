@@ -71,6 +71,12 @@ portal`, `/billing/subscription`, `/billing/webhook`, `/plans`, the
 becomes purchasable, and the free tier's *1 active job* limit — browser-only
 today — moves server-side at task creation.
 
+Two financial rules the UI already enforces (app PR #7) must be mirrored
+here — see decision sheet rulings 11–12: **no downgrade endpoint** (the only
+path down is cancel-at-period-end; a mid-period switch would owe a prorated
+refund) and **pack checkout rejects active subscribers** (a paid plan already
+includes unlimited credits).
+
 ## Engine B — credits: the wallet stays, becomes plan-aware
 
 The ledger and idempotency tables are untouched. Two functions stop

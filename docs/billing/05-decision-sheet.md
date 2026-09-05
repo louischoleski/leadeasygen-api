@@ -43,6 +43,24 @@ or a scoped design change flagged below.
     a subscription row is `free`, which matches all current users. Confirm
     no grandfathering is needed.
 
+## Rulings already made (UI enforces them today; the api must mirror)
+
+These were decided during the billing-UX work (app PR #7) and are live
+client-side. Phase 3 must encode them server-side so the client-side gate is
+never the only gate:
+
+11. **Upgrades only — no downgrade endpoint.** Stripe charges the difference
+    on an upgrade, but a mid-period downgrade would owe a prorated refund.
+    The only path down is cancel-at-period-end (`cancel_at_period_end`),
+    after which the account falls back to the free tier. The UI shows lower
+    tiers as "Downgrade unavailable" and the cancel dialog leads with the
+    paid-through date.
+12. **No pack purchases while a paid plan is active.** A paid plan includes
+    unlimited credits, so selling packs to a subscriber charges for something
+    the subscription already covers. The UI disables the Buy Pack buttons;
+    `POST /v1/credits/checkout` must also reject (409) when the caller has an
+    active paid subscription.
+
 ## Known follow-ups (out of scope here, listed so they're not lost)
 
 - App billing page beyond the balance: packs → real checkout via
@@ -59,6 +77,7 @@ or a scoped design change flagged below.
 Implement the billing extension per docs/billing/03-design.md with these rulings:
 
 Decisions: 1:<…> 2:<…> 3:<…> 4:<…> 5:<…> 6:<…> 7:<…> 8:<…> 9:<…> 10:<…>
+Rulings 11–12 stand as written (object here if not): <confirmed | …>
 
 Scope: phase(s) <1 | 1–2 | 1–3>, one PR per phase, api first.
 Changes to the drafted sources: <none | list>
