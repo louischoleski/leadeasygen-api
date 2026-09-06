@@ -1,28 +1,20 @@
 import type { Express, Request, Response } from 'express';
 import type { IStoreAdapter } from '@fonderie/store/types';
 import type { IFonderieContext } from '@fonderie/core';
-import { getWalletStatus } from '@fonderie/billing';
+import { getWalletStatus, requireWalletBalance } from '@fonderie/billing';
+import { adapt } from '@fonderie/adapter-express';
 
 import { requireAuth } from '../auth/requireAuth.js';
 import { enqueueScrapeTask } from '../queue/scrapeQueue.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/**
- * Whether the caller can afford one scrape, read from the billing wallet on
- * the request context (`withBilling` populates it for every authed request).
- * Returns true when there is nothing to gate on — no wallet, or an Unlimited
- * plan whose `scrape:task` rate is absent/zero — mirroring the authoritative
- * floor the worker's debit enforces at charge time (overdraftLimit). This is
- * the immediate UX guard, not the source of truth.
- */
-function canAffordScrape(req: Request): boolean {
-	const ctx = (req as Request & { _fonderie?: IFonderieContext })._fonderie;
-	const wallet = ctx ? getWalletStatus(ctx) : null;
-	const cost = wallet?.rates['scrape:task']?.cost;
-	if (!wallet || cost === undefined || cost === 0n) return true;
-	return wallet.balance - cost >= -wallet.overdraftLimit;
-}
+// The scrape affordability gate is billing's own requireWalletBalance middleware
+// (adapted onto Express), applied to the create/retry routes below: it reads the
+// wallet on the request ctx, and returns 402 INSUFFICIENT_CREDITS when the
+// balance can't cover the plan's `scrape:task` rate (Unlimited plans have no
+// rate, so it no-ops). The worker's debit remains the authoritative floor.
+const requireScrapeCredit = adapt(requireWalletBalance('scrape:task'));
 
 /** The caller's current wallet balance as a number, or null on Unlimited/none. */
 function walletBalance(req: Request): number | null {
@@ -114,7 +106,7 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 	// params ({ location, keyword, radiusKm?, category?, groupId? }); with
 	// params, the search URL is derived server-side and the params stored for
 	// rich listings.
-	app.post('/v1/tasks/create', ...requireAuth(store), async (req: Request, res: Response) => {
+	app.post('/v1/tasks/create', ...requireAuth(store), requireScrapeCredit, async (req: Request, res: Response) => {
 		const userId = req.user!.id;
 		const body = (req.body ?? {}) as Record<string, unknown>;
 
@@ -146,14 +138,10 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 			limit = n;
 		}
 
-		// Fast fail on the wallet balance. No deduction here — the credit is
-		// charged on completion by the worker (so a failed scrape never costs the
-		// user anything), and the worker's debit is the authoritative floor; this
-		// is the immediate UX guard.
-		if (!canAffordScrape(req)) {
-			return res.status(403).json({ error: 'Insufficient credits', balance: walletBalance(req) });
-		}
-
+		// Affordability was gated by requireScrapeCredit (402) before this handler.
+		// No deduction here — the credit is charged on completion by the worker
+		// (a failed scrape never costs the user), and that debit is the
+		// authoritative floor.
 		try {
 			const inserted = await store.query<{ id: string }>(
 				'INSERT INTO scrape_tasks (user_id, url, "limit", status, params) VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id',
@@ -179,18 +167,15 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 	// POST /v1/tasks/:id/retry — re-run a failed task. The fresh task copies
 	// the original's url/limit/params; the failed row is marked superseded so
 	// listings show only the new attempt, never the stale failure.
-	app.post('/v1/tasks/:id/retry', ...requireAuth(store), async (req: Request, res: Response) => {
+	app.post('/v1/tasks/:id/retry', ...requireAuth(store), requireScrapeCredit, async (req: Request, res: Response) => {
 		const { id } = req.params;
 		if (!UUID_RE.test(id)) {
 			return res.status(404).json({ error: 'Not found' });
 		}
 		const userId = req.user!.id;
 
-		// Fast fail on the wallet balance, same as create (charged on completion).
-		if (!canAffordScrape(req)) {
-			return res.status(403).json({ error: 'Insufficient credits', balance: walletBalance(req) });
-		}
-
+		// Affordability gated by requireScrapeCredit (402) before this handler;
+		// charged on completion by the worker, same as create.
 		try {
 			const outcome = await store.transaction(async (tx) => {
 				const rows = await tx.query<Pick<TaskRow, 'id' | 'url' | 'limit' | 'status' | 'params'> & { superseded_by: string | null }>(

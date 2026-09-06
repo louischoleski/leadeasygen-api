@@ -154,7 +154,8 @@ async function main() {
 					},
 					resolveRecipient,
 					successUrl: `${frontendUrl}/billing?checkout=success`,
-					cancelUrl: `${frontendUrl}/billing?checkout=cancel`,
+					// 'cancelled' (not 'cancel') to match the app's return handler.
+					cancelUrl: `${frontendUrl}/billing?checkout=cancelled`,
 				},
 				notifyBus,
 			),
@@ -249,16 +250,10 @@ async function main() {
 		// Task management API under /v1/tasks.
 		registerTaskRoutes(app, store);
 
-		// GET /v1/credits/balance — compatibility shim for the current frontend,
-		// which still reads the balance from this path. Wallet-backed (same source
-		// as /auth/me). Removed in the client cutover (phase E), when the app moves
-		// to billing's GET /billing/wallet. Pack checkout and transaction history
-		// are billing's now: POST /billing/wallet/checkout, GET /billing/wallet/transactions.
-		app.get('/v1/credits/balance', ...requireAuth(store), (req, res) => {
-			const ctx = (req as typeof req & { _fonderie?: IFonderieContext })._fonderie;
-			const credits = ctx ? Number(getWalletStatus(ctx)?.balance ?? 0n) : 0;
-			res.json({ credits });
-		});
+		// The credit balance is billing's now — the app reads GET /billing/wallet
+		// (via @fonderie/client / @fonderie/react-billing). The old
+		// /v1/credits/balance compatibility shim was removed in the phase-E client
+		// cutover; nothing under /v1/credits remains.
 
 		modules = ['auth', 'tasks', 'billing'];
 	} else {
