@@ -7,6 +7,9 @@ import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migr
 import { EventsModule, MemoryTransport } from '@fonderie/events';
 import { CourierModule } from '@fonderie/courier';
 import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
+import { BillingModule, StripeProvider, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
+import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
+import type { ResolveRecipient } from '@fonderie/billing';
 import { mount } from '@fonderie/adapter-express';
 import express from 'express';
 import Stripe from 'stripe';
@@ -16,6 +19,7 @@ import { requireAuth } from './auth/requireAuth.js';
 import { registerTaskRoutes } from './tasks/routes.js';
 import { loadPacks } from './credits/packs.js';
 import { registerCreditRoutes, registerStripeWebhook } from './credits/routes.js';
+import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
 
 async function main() {
 	const app = express();
@@ -63,6 +67,11 @@ async function main() {
 		// the auth notification types (email-verification, password-reset, …)
 		// are rendered from.
 		await new InternalMigrationRunner(store, courierMigrationsPath()).run();
+			// Billing owns fonderie_plans / fonderie_subscriptions and the
+			// stored-value wallet tables (fonderie_wallet_*). Created alongside the
+			// legacy credits tables during the migration — nothing reads the wallet
+			// through billing yet (see src/billing/catalog.ts).
+			await new InternalMigrationRunner(store, billingMigrationsPath()).run();
 
 		// Stripe one-time credit packs (no subscriptions). Optional: without a
 		// secret key the credit routes simply aren't registered.
@@ -100,6 +109,21 @@ async function main() {
 		const eventsModule = new EventsModule({ transport: new MemoryTransport() });
 		const notifyBus = smtpHost ? eventsModule.bus : undefined;
 
+		// Billing's money flows are webhook-driven (no session) — map a subscriber
+		// id to the address courier should reach for receipts / dunning / low
+		// balance. LeadEasyGen bills users directly (no workspaces), so resolve the
+		// user's own email; a workspace subscriber can't occur here.
+		const resolveRecipient: ResolveRecipient = async (subscriberType, id) => {
+			if (subscriberType !== 'user') return null;
+			const [row] = await store.query<{ email: string | null; phone: string | null }>(
+				'SELECT email, phone FROM fonderie_users WHERE id = $1 AND deleted_at IS NULL',
+				[id],
+			);
+			return row && (row.email || row.phone)
+				? { email: row.email, phone: row.phone, deviceToken: null }
+				: null;
+		};
+
 		// Standard Fonderie auth mold: stateless JWT sessions, email provider.
 		// (Clerk is not a Fonderie brick; @fonderie/auth is the default.)
 		// Registers POST /auth/register, POST /auth/login, POST /auth/refresh,
@@ -112,6 +136,35 @@ async function main() {
 					appName: 'LeadEasyGen',
 					providers: ['email'],
 					requireVerification: false,
+				},
+				notifyBus,
+			),
+		);
+
+		// Billing: subscriptions (the Unlimited plan) AND the credit wallet, driven
+		// from one catalog (src/billing/catalog.ts). Registered alongside the legacy
+		// src/credits system during the migration — nothing debits the wallet
+		// through billing yet, so this is additive: it creates the tables + syncs
+		// the plan catalog, but the running app is unchanged until cutover.
+		fonderieApp = fonderieApp.register(
+			new BillingModule(
+				store,
+				{
+					provider: new StripeProvider(
+						process.env.STRIPE_SECRET_KEY ?? 'sk_test_placeholder',
+						process.env.STRIPE_WEBHOOK_SECRET,
+					),
+					webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+					plans: PLANS,
+					wallet: {
+						currency: WALLET_CURRENCY,
+						precision: WALLET_PRECISION,
+						creditPacks: CREDIT_PACKS,
+						webhookSecret: process.env.STRIPE_WALLET_WEBHOOK_SECRET,
+					},
+					resolveRecipient,
+					successUrl: `${frontendUrl}/billing?checkout=success`,
+					cancelUrl: `${frontendUrl}/billing?checkout=cancel`,
 				},
 				notifyBus,
 			),
@@ -135,6 +188,17 @@ async function main() {
 							'mfa-enabled': [...emailOnly],
 							'mfa-disabled': [...emailOnly],
 							'mfa-backup-codes-regenerated': [...emailOnly],
+							// Billing money-flow notices (subscription + wallet). Bodies
+							// come from billing's DEFAULT_TEMPLATES (wired below) rendered
+							// in the DB-seeded layout; no per-key template to author here.
+							[BILLING_MESSAGE_KEYS.subscriptionCanceled]: [...emailOnly],
+							[BILLING_MESSAGE_KEYS.paymentFailed]: [...emailOnly],
+							[BILLING_MESSAGE_KEYS.trialEnding]: [...emailOnly],
+							[BILLING_MESSAGE_KEYS.renewalReceipt]: [...emailOnly],
+							[BILLING_MESSAGE_KEYS.creditsLow]: [...emailOnly],
+							[BILLING_MESSAGE_KEYS.paymentReceipt]: [...emailOnly],
+							[BILLING_MESSAGE_KEYS.refundProcessed]: [...emailOnly],
+							[BILLING_MESSAGE_KEYS.autoRechargeFailed]: [...emailOnly],
 						},
 						email: {
 							provider: 'smtp',
@@ -147,7 +211,9 @@ async function main() {
 								pass: process.env.SMTP_PASS!,
 							},
 						},
-						templates: { source: 'db' },
+						// DB-seeded auth templates (present) win; billing's notices have
+						// no DB seed, so they fall back to billing's shipped defaults.
+						templates: { source: 'db', defaults: [BILLING_DEFAULT_TEMPLATES] },
 					},
 					store,
 					notifyBus,
