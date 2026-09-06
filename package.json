@@ -12,6 +12,7 @@
 		"start": "node dist/index.js",
 		"lint": "oxlint",
 		"typecheck": "tsc --noEmit",
+		"backfill:wallet": "tsx src/billing/backfill.ts",
 		"test:e2e": "playwright test",
 		"test:e2e:ui": "playwright test --ui"
 	},
