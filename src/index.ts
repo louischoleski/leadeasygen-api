@@ -151,6 +151,11 @@ async function main() {
 						precision: WALLET_PRECISION,
 						creditPacks: CREDIT_PACKS,
 						webhookSecret: process.env.STRIPE_WALLET_WEBHOOK_SECRET,
+						// Unlimited already includes credits, so block pack purchases
+						// for an active/trialing paid subscriber (server-enforced; the
+						// app also hides packs from them in the UI). Free/pay-as-you-go
+						// buyers are unaffected.
+						blockPacksWhileSubscribed: true,
 					},
 					resolveRecipient,
 					successUrl: `${frontendUrl}/billing?checkout=success`,
