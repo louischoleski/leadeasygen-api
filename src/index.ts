@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { FonderieApp, defineConfig, type IFonderieContext } from '@fonderie/core';
+import { FonderieApp, defineConfig } from '@fonderie/core';
 import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
 import { getMigrationsPath as authMigrationsPath } from '@fonderie/auth/migrations';
@@ -7,7 +7,7 @@ import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migr
 import { EventsModule, MemoryTransport } from '@fonderie/events';
 import { CourierModule } from '@fonderie/courier';
 import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
-import { BillingModule, StripeProvider, getWalletStatus, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
+import { BillingModule, StripeProvider, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
 import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { mount } from '@fonderie/adapter-express';
@@ -220,14 +220,11 @@ async function main() {
 		// Express. bridge runs first, so custom routes added below see req._fonderie.
 		mount(app, fonderie);
 
-		// GET /auth/me — requireAuth, returns the current user plus the live
-		// credit balance. The balance is the billing wallet's (populated on the
-		// request context by withBilling), exposed under the same `credits` field
-		// the client already reads so the contract is unchanged.
+		// GET /auth/me — requireAuth, returns the current user. The credit balance
+		// is NOT here anymore: it lives on the billing wallet, which the client
+		// reads via GET /billing/wallet (@fonderie/react-billing's useWallet).
 		app.get('/auth/me', ...requireAuth(store), (req, res) => {
-			const ctx = (req as typeof req & { _fonderie?: IFonderieContext })._fonderie;
-			const credits = ctx ? Number(getWalletStatus(ctx)?.balance ?? 0n) : 0;
-			res.json({ user: { ...req.user, credits } });
+			res.json({ user: req.user });
 		});
 
 		// PATCH /v1/users/me — update the editable display name.
