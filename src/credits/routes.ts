@@ -1,6 +1,8 @@
 import express, { type Express, type Request, type Response } from 'express';
 import type Stripe from 'stripe';
 import type { IStoreAdapter } from '@fonderie/store/types';
+import type { IFonderieContext } from '@fonderie/core';
+import { getWalletStatus } from '@fonderie/billing';
 
 import { requireAuth } from '../auth/requireAuth.js';
 import { isPack, type Pack, type PackDef } from './packs.js';
@@ -138,19 +140,13 @@ export function registerCreditRoutes(
 		}
 	});
 
-	// GET /v1/credits/balance — current credit balance, derived from the ledger
-	// (source of truth). fonderie_users.credits is only a cache.
-	app.get('/v1/credits/balance', ...requireAuth(store), async (req: Request, res: Response) => {
-		try {
-			const rows = await store.query<{ balance: number }>(
-				'SELECT COALESCE(SUM(amount), 0)::int AS balance FROM credit_transactions WHERE user_id = $1',
-				[req.user!.id],
-			);
-			return res.json({ credits: rows[0]?.balance ?? 0 });
-		} catch (err) {
-			console.error('GET /v1/credits/balance failed:', err);
-			return res.status(500).json({ error: 'Internal Server Error' });
-		}
+	// GET /v1/credits/balance — current credit balance, read from the billing
+	// wallet (source of truth) that withBilling populates on the request
+	// context. Same `{ credits }` shape the client already consumes.
+	app.get('/v1/credits/balance', ...requireAuth(store), (req: Request, res: Response) => {
+		const ctx = (req as Request & { _fonderie?: IFonderieContext })._fonderie;
+		const credits = ctx ? Number(getWalletStatus(ctx)?.balance ?? 0n) : 0;
+		return res.json({ credits });
 	});
 
 	// GET /v1/credits/transactions — the user's ledger (most recent 50).

@@ -58,3 +58,40 @@ function priceId(envKey: string): { priceId?: string } {
 	const id = process.env[envKey];
 	return id ? { priceId: id } : {};
 }
+
+// Everything the worker needs to charge one completed scrape through the wallet.
+// `allowance` mirrors what withBilling carries on the request ctx, so a debit
+// crossing a grant-period boundary settles the stale allowance in the same
+// transaction as the spend (see debitWallet's `allowance` option).
+export interface ScrapeCharge {
+	cost: bigint;
+	currency: string;
+	overdraftLimit: bigint;
+	grantPeriod: 'month' | 'week' | 'day';
+	grantRollover: 'none' | 'full' | { cap: bigint };
+}
+
+/**
+ * The wallet charge for one completed scrape on a given plan, resolved from
+ * this same catalog — the single config source the BillingModule also reads.
+ * Returns null when the plan has no `scrape:task` rate (Unlimited → scraping is
+ * free), so the caller skips the debit entirely.
+ *
+ * The worker (worker.ts) runs outside the request context and so cannot read
+ * the wallet off withBilling's ctx; this mirrors the fields resolvePlanWallet
+ * would supply, for exactly this one metered debit. Defaulting matches
+ * resolvePlanWallet (plan → global → hardcoded).
+ */
+export function resolveScrapeCharge(planName: string | null | undefined): ScrapeCharge | null {
+	const plan =
+		PLANS.find((p) => p.name.toLowerCase() === (planName ?? 'free').toLowerCase()) ?? PLANS[0];
+	const cost = plan.wallet?.rates?.['scrape:task']?.cost;
+	if (cost === undefined || cost === 0n) return null;
+	return {
+		cost,
+		currency: plan.wallet?.currency ?? WALLET_CURRENCY,
+		overdraftLimit: plan.wallet?.overdraftLimit ?? 0n,
+		grantPeriod: plan.wallet?.grantPeriod ?? 'month',
+		grantRollover: plan.wallet?.grantRollover ?? 'none',
+	};
+}

@@ -1,10 +1,35 @@
 import type { Express, Request, Response } from 'express';
 import type { IStoreAdapter } from '@fonderie/store/types';
+import type { IFonderieContext } from '@fonderie/core';
+import { getWalletStatus } from '@fonderie/billing';
 
 import { requireAuth } from '../auth/requireAuth.js';
 import { enqueueScrapeTask } from '../queue/scrapeQueue.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Whether the caller can afford one scrape, read from the billing wallet on
+ * the request context (`withBilling` populates it for every authed request).
+ * Returns true when there is nothing to gate on — no wallet, or an Unlimited
+ * plan whose `scrape:task` rate is absent/zero — mirroring the authoritative
+ * floor the worker's debit enforces at charge time (overdraftLimit). This is
+ * the immediate UX guard, not the source of truth.
+ */
+function canAffordScrape(req: Request): boolean {
+	const ctx = (req as Request & { _fonderie?: IFonderieContext })._fonderie;
+	const wallet = ctx ? getWalletStatus(ctx) : null;
+	const cost = wallet?.rates['scrape:task']?.cost;
+	if (!wallet || cost === undefined || cost === 0n) return true;
+	return wallet.balance - cost >= -wallet.overdraftLimit;
+}
+
+/** The caller's current wallet balance as a number, or null on Unlimited/none. */
+function walletBalance(req: Request): number | null {
+	const ctx = (req as Request & { _fonderie?: IFonderieContext })._fonderie;
+	const wallet = ctx ? getWalletStatus(ctx) : null;
+	return wallet ? Number(wallet.balance) : null;
+}
 
 /** A Google Maps URL is one pointing at maps or the app short-link host. */
 function isGoogleMapsUrl(url: string): boolean {
@@ -121,47 +146,29 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 			limit = n;
 		}
 
-		// Fast fail using the credits attached to req.user by requireAuth
-		// (already inclusive of any just-applied monthly grant).
-		if ((req.user!.credits ?? 0) < 1) {
-			return res.status(403).json({ error: 'Insufficient credits', balance: req.user!.credits });
+		// Fast fail on the wallet balance. No deduction here — the credit is
+		// charged on completion by the worker (so a failed scrape never costs the
+		// user anything), and the worker's debit is the authoritative floor; this
+		// is the immediate UX guard.
+		if (!canAffordScrape(req)) {
+			return res.status(403).json({ error: 'Insufficient credits', balance: walletBalance(req) });
 		}
 
 		try {
-			// Authoritative balance check (from the ledger) + task insert, in one
-			// transaction. No deduction here — the credit is charged on completion
-			// by the worker, so a failed scrape never costs the user anything.
-			const outcome = await store.transaction(async (tx) => {
-				const rows = await tx.query<{ balance: number }>(
-					'SELECT COALESCE(SUM(amount), 0)::int AS balance FROM credit_transactions WHERE user_id = $1',
-					[userId],
-				);
-				const balance = rows[0]?.balance ?? 0;
-				if (balance < 1) {
-					return { ok: false as const, balance };
-				}
+			const inserted = await store.query<{ id: string }>(
+				'INSERT INTO scrape_tasks (user_id, url, "limit", status, params) VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id',
+				[userId, url, limit, 'pending', params === null ? null : JSON.stringify(params)],
+			);
+			const taskId = inserted[0]!.id;
 
-				const inserted = await tx.query<{ id: string }>(
-					'INSERT INTO scrape_tasks (user_id, url, "limit", status, params) VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id',
-					[userId, url, limit, 'pending', params === null ? null : JSON.stringify(params)],
-				);
-
-				// Balance is unchanged at creation (charged on completion).
-				return { ok: true as const, taskId: inserted[0]!.id, remainingCredits: balance };
-			});
-
-			if (!outcome.ok) {
-				return res.status(403).json({ error: 'Insufficient credits', balance: outcome.balance });
-			}
-
-			// Enqueue only after the transaction has committed.
-			await enqueueScrapeTask(store, outcome.taskId);
+			// Enqueue only after the insert has committed.
+			await enqueueScrapeTask(store, taskId);
 
 			return res.status(201).json({
-				taskId: outcome.taskId,
+				taskId,
 				status: 'pending',
 				params,
-				remainingCredits: outcome.remainingCredits,
+				remainingCredits: walletBalance(req),
 			});
 		} catch (err) {
 			console.error('POST /v1/tasks/create failed:', err);
@@ -179,6 +186,11 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 		}
 		const userId = req.user!.id;
 
+		// Fast fail on the wallet balance, same as create (charged on completion).
+		if (!canAffordScrape(req)) {
+			return res.status(403).json({ error: 'Insufficient credits', balance: walletBalance(req) });
+		}
+
 		try {
 			const outcome = await store.transaction(async (tx) => {
 				const rows = await tx.query<Pick<TaskRow, 'id' | 'url' | 'limit' | 'status' | 'params'> & { superseded_by: string | null }>(
@@ -191,13 +203,6 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 					return { kind: 'not-retryable' as const, status: task.status };
 				}
 
-				const balRows = await tx.query<{ balance: number }>(
-					'SELECT COALESCE(SUM(amount), 0)::int AS balance FROM credit_transactions WHERE user_id = $1',
-					[userId],
-				);
-				const balance = balRows[0]?.balance ?? 0;
-				if (balance < 1) return { kind: 'insufficient' as const, balance };
-
 				const inserted = await tx.query<{ id: string }>(
 					'INSERT INTO scrape_tasks (user_id, url, "limit", status, params) VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id',
 					[userId, task.url, task.limit, 'pending', task.params === null ? null : JSON.stringify(task.params)],
@@ -207,7 +212,7 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 					'UPDATE scrape_tasks SET superseded_by = $1, updated_at = now() WHERE id = $2',
 					[newTaskId, task.id],
 				);
-				return { kind: 'ok' as const, taskId: newTaskId, params: task.params, remainingCredits: balance };
+				return { kind: 'ok' as const, taskId: newTaskId, params: task.params };
 			});
 
 			if (outcome.kind === 'not-found') {
@@ -215,9 +220,6 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 			}
 			if (outcome.kind === 'not-retryable') {
 				return res.status(409).json({ error: 'Only failed tasks can be retried', status: outcome.status });
-			}
-			if (outcome.kind === 'insufficient') {
-				return res.status(403).json({ error: 'Insufficient credits', balance: outcome.balance });
 			}
 
 			// Enqueue only after the transaction has committed.
@@ -227,7 +229,7 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 				taskId: outcome.taskId,
 				status: 'pending',
 				params: outcome.params,
-				remainingCredits: outcome.remainingCredits,
+				remainingCredits: walletBalance(req),
 			});
 		} catch (err) {
 			console.error('POST /v1/tasks/:id/retry failed:', err);

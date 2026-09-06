@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { FonderieApp, defineConfig } from '@fonderie/core';
+import { FonderieApp, defineConfig, type IFonderieContext } from '@fonderie/core';
 import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
 import { getMigrationsPath as authMigrationsPath } from '@fonderie/auth/migrations';
@@ -7,7 +7,7 @@ import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migr
 import { EventsModule, MemoryTransport } from '@fonderie/events';
 import { CourierModule } from '@fonderie/courier';
 import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
-import { BillingModule, StripeProvider, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
+import { BillingModule, StripeProvider, getWalletStatus, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
 import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { mount } from '@fonderie/adapter-express';
@@ -229,11 +229,14 @@ async function main() {
 		// Express. bridge runs first, so custom routes added below see req._fonderie.
 		mount(app, fonderie);
 
-		// GET /auth/me — requireAuth, returns the current user including credits.
-		// Fonderie's own equivalent is GET /users, but that DTO omits our custom
-		// `credits` column, so we expose a dedicated route here.
+		// GET /auth/me — requireAuth, returns the current user plus the live
+		// credit balance. The balance is the billing wallet's (populated on the
+		// request context by withBilling), exposed under the same `credits` field
+		// the client already reads so the contract is unchanged.
 		app.get('/auth/me', ...requireAuth(store), (req, res) => {
-			res.json({ user: req.user });
+			const ctx = (req as typeof req & { _fonderie?: IFonderieContext })._fonderie;
+			const credits = ctx ? Number(getWalletStatus(ctx)?.balance ?? 0n) : 0;
+			res.json({ user: { ...req.user, credits } });
 		});
 
 		// PATCH /v1/users/me — update the editable display name.

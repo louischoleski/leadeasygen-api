@@ -1,5 +1,12 @@
 import 'dotenv/config';
 import { PGAdapter } from '@fonderie/store';
+import {
+	debitWallet,
+	getSubscription,
+	InsufficientFundsError,
+	currentGrantPeriod,
+	startOfNextPeriod,
+} from '@fonderie/billing';
 
 import {
 	createScrapeBus,
@@ -8,6 +15,7 @@ import {
 	type ScrapeTaskJob,
 } from './queue/scrapeQueue.js';
 import { scrapeGoogleMaps } from './scraper/engine.js';
+import { resolveScrapeCharge } from './billing/catalog.js';
 
 /**
  * Scrape-task queue worker. Runs as its own process (`npm run worker`),
@@ -50,26 +58,62 @@ async function main() {
 					limit: task.limit ?? undefined,
 				});
 
-				// Success = charge exactly one credit, atomically with the status
-				// update: mark complete, append a 'usage' ledger row, decrement the
-				// cache. A failed scrape (catch below) never reaches here, so it is
-				// never charged.
-				await store.transaction(async (tx) => {
-					await tx.query(
-						"UPDATE scrape_tasks SET results = $1::jsonb, status = 'complete', updated_at = now() WHERE id = $2",
-						[JSON.stringify(leads), taskId],
-					);
-					await tx.query(
-						"INSERT INTO credit_transactions (user_id, task_id, type, amount, description) " +
-							"VALUES ($1, $2, 'usage', -1, $3)",
-						[task.user_id, taskId, `Scrape completed: ${task.url}`],
-					);
-					await tx.query(
-						'UPDATE fonderie_users SET credits = credits - 1, updated_at = now() WHERE id = $1',
-						[task.user_id],
-					);
-				});
-				console.log(`Task ${taskId} complete — ${leads.length} lead(s), 1 credit charged.`);
+				// Success = charge the plan's per-scrape rate through the billing
+				// wallet, then mark the task complete. The debit is idempotent
+				// (idempotencyKey = taskId → a queue redelivery never double-charges)
+				// and floored (overdraftLimit from the plan → the balance can never
+				// go negative). A failed scrape (catch below) never reaches here, so
+				// it is never charged; a completed scrape the wallet can't cover is
+				// marked 'error' rather than delivered for free. Unlimited plans have
+				// no rate (resolveScrapeCharge → null), so scraping is free for them.
+				const sub = await getSubscription('user', task.user_id, store);
+				const charge = resolveScrapeCharge(sub?.plan);
+				if (charge) {
+					try {
+						await debitWallet(
+							{
+								subscriberType: 'user',
+								subscriberId: task.user_id,
+								currency: charge.currency,
+								amount: charge.cost,
+								idempotencyKey: taskId,
+								overdraftLimit: charge.overdraftLimit,
+								type: 'usage',
+								description: `Scrape completed: ${task.url}`,
+								metadata: { taskId, url: task.url },
+								// Settle a stale allowance in the same tx as the spend, so a
+								// scrape that completes after a period rollover can't spend
+								// last period's expired free credits.
+								allowance: {
+									period: currentGrantPeriod(charge.grantPeriod),
+									rollover: charge.grantRollover,
+									expiresAt: startOfNextPeriod(charge.grantPeriod),
+								},
+							},
+							store,
+						);
+					} catch (chargeErr) {
+						if (chargeErr instanceof InsufficientFundsError) {
+							await store.query(
+								"UPDATE scrape_tasks SET status = 'error', error_message = $1, updated_at = now() WHERE id = $2",
+								['Insufficient credits', taskId],
+							);
+							console.warn(
+								`Task ${taskId} scraped but the wallet can't cover it — marked error, not charged.`,
+							);
+							return;
+						}
+						throw chargeErr;
+					}
+				}
+				await store.query(
+					"UPDATE scrape_tasks SET results = $1::jsonb, status = 'complete', updated_at = now() WHERE id = $2",
+					[JSON.stringify(leads), taskId],
+				);
+				console.log(
+					`Task ${taskId} complete — ${leads.length} lead(s)` +
+						(charge ? `, ${charge.cost} credit(s) charged.` : ' (unlimited plan, no charge).'),
+				);
 			} catch (err) {
 				// Record the failure on the task and swallow the error so the job is
 				// marked processed rather than retried forever by the transport.

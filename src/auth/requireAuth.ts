@@ -6,14 +6,11 @@ import {
 } from '@fonderie/adapter-express';
 import type { IStoreAdapter } from '@fonderie/store/types';
 
-import { ensureMonthlyGrant } from '../credits/monthlyGrant.js';
-
 /** The current user attached to the request after `requireAuth`. */
 export interface AuthedUser {
 	id: string;
 	email: string | null;
 	displayName: string | null;
-	credits: number;
 	createdAt: Date;
 }
 
@@ -30,7 +27,6 @@ interface UserRow {
 	id: string;
 	email: string | null;
 	display_name: string | null;
-	credits: number;
 	created_at: Date;
 }
 
@@ -41,10 +37,15 @@ function unauthorized(res: ExpressResponse): void {
 }
 
 /**
- * Loads the authenticated user's full record (including the product-specific
- * `credits` balance) from `fonderie_users` and attaches it to `req.user`.
- * Runs only after `fonderieRequireAuth` has validated the session, so the
- * fonderie context and its user id are guaranteed present.
+ * Loads the authenticated user's record from `fonderie_users` and attaches it
+ * to `req.user`. Runs only after `fonderieRequireAuth` has validated the
+ * session, so the fonderie context and its user id are guaranteed present.
+ *
+ * The credit balance is NOT read here anymore: `@fonderie/billing`'s
+ * `withBilling` middleware (registered globally) applies the free plan's
+ * monthly grant and exposes the live balance on the request context, which the
+ * read sites pull via `getWalletStatus(ctx)`. There is no product `credits`
+ * column to load and no grant to trigger.
  */
 function attachUser(store: IStoreAdapter) {
 	return async (req: ExpressRequest, res: ExpressResponse, next: NextFunction): Promise<void> => {
@@ -56,14 +57,8 @@ function attachUser(store: IStoreAdapter) {
 		}
 
 		try {
-			// The free plan's monthly credits apply lazily on any authenticated
-			// request — before the user row is read, so `req.user.credits`
-			// already includes a fresh grant. Non-fatal on error: the next
-			// request retries, and a broken database fails the SELECT below.
-			await ensureMonthlyGrant(store, userId).catch(() => undefined);
-
 			const rows = await store.query<UserRow>(
-				'SELECT id, email, display_name, credits, created_at FROM fonderie_users WHERE id = $1 AND deleted_at IS NULL',
+				'SELECT id, email, display_name, created_at FROM fonderie_users WHERE id = $1 AND deleted_at IS NULL',
 				[userId],
 			);
 			const row = rows[0];
@@ -77,7 +72,6 @@ function attachUser(store: IStoreAdapter) {
 				id: row.id,
 				email: row.email,
 				displayName: row.display_name,
-				credits: row.credits,
 				createdAt: row.created_at,
 			};
 			next();
@@ -89,7 +83,8 @@ function attachUser(store: IStoreAdapter) {
 
 /**
  * `requireAuth` for custom Express routes: validates the Fonderie session
- * (401 on failure) and then attaches the full `req.user` (with `credits`).
+ * (401 on failure) and then attaches `req.user`. The credit balance lives on
+ * the billing wallet (read via `getWalletStatus`), not on `req.user`.
  * Spread into a route: `app.get('/x', ...requireAuth(store), handler)`.
  */
 export function requireAuth(store: IStoreAdapter) {
