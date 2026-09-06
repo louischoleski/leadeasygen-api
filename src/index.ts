@@ -12,13 +12,10 @@ import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/mi
 import type { ResolveRecipient } from '@fonderie/billing';
 import { mount } from '@fonderie/adapter-express';
 import express from 'express';
-import Stripe from 'stripe';
 
 import { getAppMigrationsPath } from './db/migrations/index.js';
 import { requireAuth } from './auth/requireAuth.js';
 import { registerTaskRoutes } from './tasks/routes.js';
-import { loadPacks } from './credits/packs.js';
-import { registerCreditRoutes, registerStripeWebhook } from './credits/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
 
 async function main() {
@@ -73,30 +70,23 @@ async function main() {
 			// through billing yet (see src/billing/catalog.ts).
 			await new InternalMigrationRunner(store, billingMigrationsPath()).run();
 
-		// Stripe one-time credit packs (no subscriptions). Optional: without a
-		// secret key the credit routes simply aren't registered.
-		const stripeKey = process.env.STRIPE_SECRET_KEY;
-		const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+		// Credit-pack purchases and their payment webhook belong to
+		// @fonderie/billing now: POST /billing/wallet/checkout and
+		// POST /billing/webhook/payment, configured on the BillingModule below
+		// (wallet.creditPacks from the shared catalog, wallet.webhookSecret =
+		// STRIPE_WALLET_WEBHOOK_SECRET) and mounted with the rest of the Fonderie
+		// routes. No hand-rolled Stripe checkout, no raw `stripe` SDK.
 		const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:5173';
-		const packs = loadPacks(process.env);
-		const stripe = stripeKey ? new Stripe(stripeKey) : null;
-
-		// Stripe webhook must be registered BEFORE express.json() and mount():
-		// signature verification needs the raw body, so this route has to win the
-		// match before any middleware consumes the request stream.
-		if (stripe && webhookSecret) {
-			registerStripeWebhook(app, store, { stripe, webhookSecret, packs });
-		} else {
-			console.warn('⚠️  STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET not set — credit purchases disabled.');
-		}
 
 		// NOTE: do NOT add express.json() here. Fonderie's Express adapter reads
 		// the raw request stream itself (bridge → expressRequestToWeb → readStream)
 		// and then populates req.body from Fonderie's own body parser. Running
 		// express.json() first drains the stream, so the adapter's re-read never
 		// receives an 'end' event and every POST with a body (e.g. /auth/register)
-		// hangs until the client times out. The Stripe webhook above is matched
-		// before the bridge middleware and uses express.raw, so it is unaffected.
+		// hangs until the client times out. Billing's payment webhook verifies the
+		// Stripe signature off the raw body via ctx.request.text(); core's body
+		// parser clones the request before reading, so the raw bytes survive — no
+		// pre-bridge express.raw() route needed.
 
 		// Transactional email via @fonderie/courier. Auth publishes a notification
 		// event (verification pin, password-reset pin, …) onto an EventBus; courier
@@ -259,13 +249,18 @@ async function main() {
 		// Task management API under /v1/tasks.
 		registerTaskRoutes(app, store);
 
-		// Credit purchase routes (checkout + balance). The webhook is registered
-		// earlier, above express.json().
-		modules = ['auth', 'tasks'];
-		if (stripe) {
-			registerCreditRoutes(app, store, { stripe, packs, frontendUrl });
-			modules.push('credits');
-		}
+		// GET /v1/credits/balance — compatibility shim for the current frontend,
+		// which still reads the balance from this path. Wallet-backed (same source
+		// as /auth/me). Removed in the client cutover (phase E), when the app moves
+		// to billing's GET /billing/wallet. Pack checkout and transaction history
+		// are billing's now: POST /billing/wallet/checkout, GET /billing/wallet/transactions.
+		app.get('/v1/credits/balance', ...requireAuth(store), (req, res) => {
+			const ctx = (req as typeof req & { _fonderie?: IFonderieContext })._fonderie;
+			const credits = ctx ? Number(getWalletStatus(ctx)?.balance ?? 0n) : 0;
+			res.json({ credits });
+		});
+
+		modules = ['auth', 'tasks', 'billing'];
 	} else {
 		console.warn(
 			'⚠️  DATABASE_URL is not set — Fonderie modules are disabled. ' +
