@@ -7,7 +7,7 @@ import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migr
 import { EventsModule, MemoryTransport } from '@fonderie/events';
 import { CourierModule } from '@fonderie/courier';
 import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
-import { BillingModule, StripeProvider, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
+import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
 import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { mount } from '@fonderie/adapter-express';
@@ -143,6 +143,10 @@ async function main() {
 					provider: new StripeProvider(
 						process.env.STRIPE_SECRET_KEY ?? 'sk_test_placeholder',
 						process.env.STRIPE_WEBHOOK_SECRET,
+						// In-app card entry offers card only — a concrete, displayable,
+						// off-session-chargeable payment method. Excludes wallets like Link
+						// (whose type:'link' PM has no card details to show as a card on file).
+						{ setupPaymentMethodTypes: [SUPPORTED_PAYMENT_OPTIONS.CARD] },
 					),
 					webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
 					plans: PLANS,
