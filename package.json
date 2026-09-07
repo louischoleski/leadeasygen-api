@@ -18,7 +18,7 @@
 	"dependencies": {
 		"@fonderie/adapter-express": "*",
 		"@fonderie/auth": "*",
-		"@fonderie/billing": "^8.11.0",
+		"@fonderie/billing": "^8.11.1",
 		"@fonderie/core": "*",
 		"@fonderie/courier": "^5.0.0",
 		"@fonderie/events": "*",
