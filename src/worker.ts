@@ -18,6 +18,30 @@ import { scrapeGoogleMaps } from './scraper/engine.js';
 import { resolveScrapeCharge } from './billing/catalog.js';
 
 /**
+ * Human ledger line for a completed scrape. Prefers the task's structured form
+ * params; legacy url-only tasks fall back to the Maps URL's decoded search
+ * text. Never the raw URL — that stays in the debit's metadata, not in a
+ * user-facing ledger description.
+ */
+export function scrapeDescription(
+	params: { keyword?: string; location?: string } | null,
+	url: string,
+): string {
+	if (params?.keyword && params.location) {
+		return `Scrape completed: ${params.keyword} — ${params.location}`;
+	}
+	const search = url.match(/\/maps\/search\/([^/?#]+)/);
+	if (search) {
+		try {
+			return `Scrape completed: ${decodeURIComponent(search[1]!).replace(/\+/g, ' ')}`;
+		} catch {
+			// Malformed escape in a hand-crafted URL — fall through to the bare line.
+		}
+	}
+	return 'Scrape completed';
+}
+
+/**
  * Scrape-task queue worker. Runs as its own process (`npm run worker`),
  * consuming scrape jobs from the durable Postgres event bus and driving the
  * Playwright scraper engine, persisting results back onto the task row.
@@ -38,10 +62,12 @@ async function main() {
 			console.log(`Processing task ${taskId}`);
 
 			try {
-				const rows = await store.query<{ user_id: string; url: string; limit: number | null }>(
-					'SELECT user_id, url, "limit" FROM scrape_tasks WHERE id = $1',
-					[taskId],
-				);
+				const rows = await store.query<{
+					user_id: string;
+					url: string;
+					limit: number | null;
+					params: { keyword?: string; location?: string } | null;
+				}>('SELECT user_id, url, "limit", params FROM scrape_tasks WHERE id = $1', [taskId]);
 				const task = rows[0];
 				if (!task) {
 					console.warn(`Task ${taskId} not found — skipping.`);
@@ -79,7 +105,7 @@ async function main() {
 								idempotencyKey: taskId,
 								overdraftLimit: charge.overdraftLimit,
 								type: 'usage',
-								description: `Scrape completed: ${task.url}`,
+								description: scrapeDescription(task.params, task.url),
 								metadata: { taskId, url: task.url },
 								// Settle a stale allowance in the same tx as the spend, so a
 								// scrape that completes after a period rollover can't spend
