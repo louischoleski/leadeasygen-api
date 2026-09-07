@@ -82,6 +82,18 @@ export interface ScrapeCharge {
  * would supply, for exactly this one metered debit. Defaulting matches
  * resolvePlanWallet (plan → global → hardcoded).
  */
+/**
+ * The plan's cap on simultaneously active (pending/scraping) scrape tasks,
+ * from the same catalog policy. null = uncapped (Unlimited). Plan-name
+ * defaulting matches resolveScrapeCharge (unknown/absent → free).
+ */
+export function resolveActiveJobsLimit(planName: string | null | undefined): number | null {
+	const plan =
+		PLANS.find((p) => p.name.toLowerCase() === (planName ?? 'free').toLowerCase()) ?? PLANS[0];
+	const entry = plan.policy?.['activeJobs'];
+	return entry !== undefined && 'limit' in entry ? entry.limit : null;
+}
+
 export function resolveScrapeCharge(planName: string | null | undefined): ScrapeCharge | null {
 	const plan =
 		PLANS.find((p) => p.name.toLowerCase() === (planName ?? 'free').toLowerCase()) ?? PLANS[0];
