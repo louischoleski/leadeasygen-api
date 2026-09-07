@@ -21,16 +21,18 @@ export const PLANS: IBillingPlan[] = [
 		// One concurrent scrape job on free.
 		policy: { activeJobs: { limit: 1 } },
 		wallet: {
-			// 50 free credits a month, use-it-or-lose-it (allowance resets).
-			grantAmount: 50n,
+			// 5 free credits a month, use-it-or-lose-it (allowance resets) — a
+			// trial allowance, not a workload: at ~15-20 leads a scrape it shows
+			// the product working without carrying a prospector's month for free.
+			grantAmount: 5n,
 			grantPeriod: 'month',
 			grantRollover: 'none',
 			// One completed scrape task costs one credit.
 			rates: { 'scrape:task': { cost: 1n } },
 			// Block at zero — no negative balances.
 			overdraftLimit: 0n,
-			// Nudge (billing.credits-low) when the balance hits 10.
-			lowBalanceAt: 10n,
+			// Nudge (billing.credits-low) when the balance hits 2.
+			lowBalanceAt: 2n,
 		},
 	},
 	{
