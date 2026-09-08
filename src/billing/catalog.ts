@@ -51,7 +51,11 @@ export const PLANS: IBillingPlan[] = [
 export const CREDIT_PACKS: IBillingCreditPack[] = [
 	{ id: 'small', name: '10 credits', credits: 10n, priceAmount: 500n, currency: 'usd', ...priceId('STRIPE_PRICE_SMALL') },
 	{ id: 'medium', name: '50 credits', credits: 50n, priceAmount: 2000n, currency: 'usd', ...priceId('STRIPE_PRICE_MEDIUM') },
-	{ id: 'large', name: '100 credits', credits: 100n, priceAmount: 3500n, currency: 'usd', ...priceId('STRIPE_PRICE_LARGE') },
+	// Large stays a hair under the medium rate (0.38 vs 0.40/credit) so "Best
+	// value" holds, but never beats a subscription's monthly economics: 50
+	// scrapes/month via this pack is $19/mo — subscription-tier parity, where
+	// plan features win the tie.
+	{ id: 'large', name: '100 credits', credits: 100n, priceAmount: 3800n, currency: 'usd', ...priceId('STRIPE_PRICE_LARGE') },
 ];
 
 // Use a configured Stripe Price id when present; otherwise billing charges the
