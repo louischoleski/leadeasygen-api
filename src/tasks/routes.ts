@@ -94,10 +94,13 @@ const DEDUP_WINDOW = '30 days';
 
 /** The 409 body for a creation attempt past the plan's activeJobs limit. */
 function activeJobLimitBody(limit: number) {
+	// Envelope shape (reason/explanation/details) so @fonderie/client's
+	// FonderieApiError carries a distinct code the app can tell apart from other
+	// 409s (e.g. RECENT_DUPLICATE) and show a limit-specific message.
 	return {
-		error: 'Active job limit reached',
-		message: `Your plan allows ${limit} active job${limit === 1 ? '' : 's'}. Wait for it to finish or upgrade.`,
-		limit,
+		reason: 'ACTIVE_JOB_LIMIT',
+		explanation: `Your plan allows ${limit} active job${limit === 1 ? '' : 's'}. Wait for it to finish or upgrade.`,
+		details: { limit },
 	};
 }
 
@@ -235,7 +238,16 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 				// one-active-job limit the duplicate IS that active job.
 				if (dedupKey !== null && !force) {
 					const dup = await tx.query<{ id: string; status: string }>(
-						"SELECT id, status FROM scrape_tasks WHERE user_id = $1 AND dedup_key = $2 AND status <> 'error' AND superseded_by IS NULL AND created_at > now() - $3::interval ORDER BY created_at DESC LIMIT 1",
+						`SELECT id, status FROM scrape_tasks
+						   WHERE user_id = $1 AND dedup_key = $2 AND superseded_by IS NULL
+						     AND status <> 'error'
+						     AND created_at > now() - $3::interval
+						     -- A finished run that found nothing shouldn't block a retry — only
+						     -- in-progress runs and completed runs that actually returned leads
+						     -- count as a duplicate worth warning about.
+						     AND (status <> 'complete'
+						          OR jsonb_array_length(CASE WHEN jsonb_typeof(results) = 'array' THEN results ELSE '[]'::jsonb END) > 0)
+						   ORDER BY created_at DESC LIMIT 1`,
 						[userId, dedupKey, DEDUP_WINDOW],
 					);
 					if (dup[0]) {

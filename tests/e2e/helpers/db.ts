@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import pg from 'pg'
 
 /**
@@ -69,5 +70,48 @@ export function ageTask(taskId: string, days: number): Promise<void> {
       taskId,
       days,
     ])
+  })
+}
+
+/** The authenticated user's id, for seeding rows attributed to them. */
+export function getUserId(email: string): Promise<string> {
+  return withClient(async (c) => {
+    const { rows } = await c.query(`SELECT id FROM fonderie_users WHERE email = $1`, [email])
+    if (!rows[0]?.id) throw new Error(`no user ${email}`)
+    return rows[0].id as string
+  })
+}
+
+interface SearchParams {
+  keyword: string
+  location: string
+  radiusKm: number | null
+}
+
+// Mirrors the server's computeSearchKey (api/src/tasks/routes.ts). Kept in sync
+// by hand so a seeded row lands on the same dedup key the create endpoint
+// computes — the only way to test dedup against a row the live worker won't touch.
+function searchKey(p: SearchParams): string {
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ')
+  return createHash('sha256')
+    .update(JSON.stringify([norm(p.keyword), norm(p.location), p.radiusKm]))
+    .digest('hex')
+}
+
+/**
+ * Insert a synthetic `complete` scrape task with a chosen number of leads (and
+ * the matching dedup key), so a dedup test can assert the F6 rule — a finished
+ * run that found nothing is not a duplicate — without racing the live worker
+ * (this row is never enqueued).
+ */
+export function seedCompletedTask(userId: string, search: SearchParams, leadCount: number): Promise<string> {
+  const results = JSON.stringify(Array.from({ length: leadCount }, (_, i) => ({ name: `Lead ${i}` })))
+  return withClient(async (c) => {
+    const { rows } = await c.query(
+      `INSERT INTO scrape_tasks (user_id, url, status, params, dedup_key, results)
+       VALUES ($1, 'https://maps', 'complete', $2::jsonb, $3, $4::jsonb) RETURNING id`,
+      [userId, JSON.stringify(search), searchKey(search), results],
+    )
+    return rows[0].id as string
   })
 }

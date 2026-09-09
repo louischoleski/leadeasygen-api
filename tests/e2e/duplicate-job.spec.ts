@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test'
-import { ageTask, getEmailVerificationPin, hasDbUrl } from './helpers/db'
+import { ageTask, getEmailVerificationPin, getUserId, hasDbUrl, seedCompletedTask } from './helpers/db'
 
 /**
  * Per-user, rolling-window duplicate detection for scrape jobs. The same search
@@ -81,6 +81,34 @@ test.describe('duplicate scrape job', () => {
       // out past 30 days, then the same search is fresh again.
       await ageTask(firstId, 40)
       if (forcedId) await ageTask(forcedId, 40)
+      const res = await create(search)
+      expect((await body(res)).reason).not.toBe('RECENT_DUPLICATE')
+    })
+  })
+
+  // F6: a completed run that found nothing shouldn't block a retry. Uses seeded
+  // rows (never enqueued) so the assertion is immune to the live scraper.
+  test('a completed run is a duplicate only if it found leads', async ({ request }) => {
+    test.setTimeout(60_000)
+    const email = `dupzero-${Date.now()}@leadeasygen.dev`
+    const reg = await request.post('/auth/register', { data: { email, password: PASSWORD } })
+    expect(reg.ok()).toBeTruthy()
+    const access = (await body(reg)).result.tokens.access
+    const uid = await getUserId(email)
+    const create = (data: Record<string, unknown>) =>
+      request.post('/v1/tasks/create', { headers: { Authorization: `Bearer ${access}` }, data })
+
+    await test.step('completed WITH leads → duplicate', async () => {
+      const search = { location: 'Leadville, QC', keyword: 'has-leads', radiusKm: 10 }
+      await seedCompletedTask(uid, search, 3)
+      const res = await create(search)
+      expect(res.status()).toBe(409)
+      expect((await body(res)).reason).toBe('RECENT_DUPLICATE')
+    })
+
+    await test.step('completed with ZERO leads → not a duplicate', async () => {
+      const search = { location: 'Emptyville, QC', keyword: 'no-leads', radiusKm: 10 }
+      await seedCompletedTask(uid, search, 0)
       const res = await create(search)
       expect((await body(res)).reason).not.toBe('RECENT_DUPLICATE')
     })

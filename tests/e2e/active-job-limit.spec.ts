@@ -63,8 +63,8 @@ test.describe('active job limit', () => {
       const res = await createTask('cafes')
       expect(res.status()).toBe(409)
       const json = await body(res)
-      expect(json.error).toBe('Active job limit reached')
-      expect(json.limit).toBe(1)
+      expect(json.reason).toBe('ACTIVE_JOB_LIMIT')
+      expect(json.details.limit).toBe(1)
     })
 
     await test.step('only the first task exists', async () => {
