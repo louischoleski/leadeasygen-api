@@ -56,3 +56,18 @@ export function getMfaSecret(email: string, which: 'pending' | 'active'): Promis
     return rows[0].secret as string
   })
 }
+
+/**
+ * Backdate a task's created_at so a dedup test can prove the rolling window
+ * boundary without waiting real days. Only touches created_at — leaving status
+ * alone keeps the assertion robust against the live scraper worker (a task
+ * outside the window is excluded by the time predicate regardless of status).
+ */
+export function ageTask(taskId: string, days: number): Promise<void> {
+  return withClient(async (c) => {
+    await c.query(`UPDATE scrape_tasks SET created_at = now() - ($2 || ' days')::interval WHERE id = $1`, [
+      taskId,
+      days,
+    ])
+  })
+}

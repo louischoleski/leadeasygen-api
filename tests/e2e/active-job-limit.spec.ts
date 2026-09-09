@@ -43,20 +43,24 @@ test.describe('active job limit', () => {
       access = (await body(login)).result.tokens.access
     })
 
-    const createTask = () =>
+    // Distinct keywords: the second must be a *different* search, otherwise the
+    // rolling dedup guard would reject it first (RECENT_DUPLICATE) and we'd be
+    // testing dedup, not the active-jobs limit. Two different active jobs are
+    // what the limit is about.
+    const createTask = (keyword: string) =>
       request.post('/v1/tasks/create', {
         headers: { Authorization: `Bearer ${access}` },
-        data: { location: 'Sutton, QC, Canada', keyword: 'restaurants', radiusKm: 10 },
+        data: { location: 'Sutton, QC, Canada', keyword, radiusKm: 10 },
       })
 
     await test.step('first create is accepted', async () => {
-      const res = await createTask()
+      const res = await createTask('restaurants')
       expect(res.status()).toBe(201)
       expect((await body(res)).status).toBe('pending')
     })
 
-    await test.step('second create is rejected while the first is active', async () => {
-      const res = await createTask()
+    await test.step('second (distinct) create is rejected while the first is active', async () => {
+      const res = await createTask('cafes')
       expect(res.status()).toBe(409)
       const json = await body(res)
       expect(json.error).toBe('Active job limit reached')
