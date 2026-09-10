@@ -21,7 +21,7 @@
     "@fonderie/auth": "*",
     "@fonderie/billing": "^9.0.0",
     "@fonderie/core": "*",
-    "@fonderie/courier": "^6.0.0",
+    "@fonderie/courier": "^7.0.0",
     "@fonderie/events": "*",
     "@fonderie/store": "*",
     "@fonderie/workspaces": "*",
