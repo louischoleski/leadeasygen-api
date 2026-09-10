@@ -10,6 +10,9 @@ import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/mi
 import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
 import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
 import type { ResolveRecipient } from '@fonderie/billing';
+import { MediaModule, DbBlobProvider } from '@fonderie/media';
+import { getMigrationsPath as mediaMigrationsPath } from '@fonderie/media/migrations';
+import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/migrations';
 import { mount } from '@fonderie/adapter-express';
 import express from 'express';
 
@@ -69,6 +72,12 @@ async function main() {
 			// legacy credits tables during the migration — nothing reads the wallet
 			// through billing yet (see src/billing/catalog.ts).
 			await new InternalMigrationRunner(store, billingMigrationsPath()).run();
+			// Media owns fonderie_media_assets (avatar/image metadata); the bytes
+			// live in @fonderie/storage's fonderie_storage_blobs (DbBlobProvider,
+			// below) — so storage's migration must run too. Zero extra infra: the
+			// images sit in Postgres, no S3/MinIO at this stage.
+			await new InternalMigrationRunner(store, storageMigrationsPath()).run();
+			await new InternalMigrationRunner(store, mediaMigrationsPath()).run();
 
 		// Credit-pack purchases and their payment webhook belong to
 		// @fonderie/billing now: POST /billing/wallet/checkout and
@@ -223,6 +232,17 @@ async function main() {
 			console.warn('⚠️  SMTP_HOST not set — transactional email disabled (pins recorded in DB only).');
 		}
 
+		// Avatar / image uploads via @fonderie/media. DbBlobProvider stores the
+		// bytes in Postgres (fonderie_storage_blobs) — zero infra; swap in an
+		// S3Provider later with one line. Default policy: a user uploads their
+		// own avatar (ownerType 'user', ownerId = caller), 1 MB cap, magic-byte
+		// sniffed (SVG rejected = stored-XSS). Registers POST /media, PUBLIC
+		// cached GET /media/:id (an <img src> can't send a Bearer token), and
+		// uploader-only DELETE /media/:id.
+		fonderieApp = fonderieApp.register(
+			new MediaModule(store, { provider: new DbBlobProvider(store) }),
+		);
+
 		const fonderie = await fonderieApp.boot();
 
 		// mount() wires body parsing, context (bridge), and the auth routes onto
@@ -261,7 +281,7 @@ async function main() {
 		// /v1/credits/balance compatibility shim was removed in the phase-E client
 		// cutover; nothing under /v1/credits remains.
 
-		modules = ['auth', 'tasks', 'billing'];
+		modules = ['auth', 'tasks', 'billing', 'media'];
 	} else {
 		console.warn(
 			'⚠️  DATABASE_URL is not set — Fonderie modules are disabled. ' +
