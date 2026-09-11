@@ -263,16 +263,41 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 			);
 			if (consumed.length > 0) return next(); // billing won't grant a trial anyway
 
-			// The explicit paid-without-trial opt-in (the 409 below points here):
-			// consume the trial up-front — billing's schema strips unknown body
-			// fields, and its createSession sees the consumed trial and builds a
-			// plain paid checkout. Nothing to risk-score: no trial is granted.
+			// The explicit paid-without-trial opt-in (the 409 below points here).
+			// Billing's ONLY lever to suppress the trial is the consumed marker
+			// (createSession applies trialDays unless hasConsumedTrial), so we must
+			// write it BEFORE billing builds the checkout. To avoid forfeiting a
+			// (false-positive) user's future trial eligibility when no paid
+			// subscription results, the marker is written only if it wasn't
+			// already present, and REMOVED when billing fails to issue a checkout
+			// (response < 200 or >= 400). Residual: a checkout that is created
+			// (2xx) then abandoned can't be detected synchronously — that case is
+			// reconciled by the checkout.session.expired / incomplete-subscription
+			// sweep tracked with the durable-enforcement work.
 			if (body.skipTrial === true) {
-				await deps.store.query(
+				const inserted = await deps.store.query<{ subscriber_id: string }>(
 					`INSERT INTO fonderie_subscription_trials (subscriber_type, subscriber_id)
-					 VALUES ('user', $1) ON CONFLICT (subscriber_type, subscriber_id) DO NOTHING`,
+					 VALUES ('user', $1) ON CONFLICT (subscriber_type, subscriber_id) DO NOTHING
+					 RETURNING subscriber_id`,
 					[user.id],
 				);
+				// Only OUR insert is reversible — never delete a marker a real
+				// prior trial/skip already set.
+				if (inserted.length > 0) {
+					(res as unknown as NodeJS.EventEmitter).once('finish', () => {
+						if (res.statusCode < 200 || res.statusCode >= 400) {
+							void deps.store
+								.query(
+									`DELETE FROM fonderie_subscription_trials
+									 WHERE subscriber_type = 'user' AND subscriber_id = $1`,
+									[user.id],
+								)
+								.catch((err) =>
+									console.error('trial skip-consume rollback failed:', err),
+								);
+						}
+					});
+				}
 				return next();
 			}
 
@@ -284,9 +309,11 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 			const domainHash = domain ? hashSignal('domain', domain) : null;
 			const cardHash = await cardFingerprintHash(deps, user.id);
 
-			const verdict: { outcome: 'granted' | 'challenged' | 'denied'; score: number } = {
+			// The score is recorded on the trial_signals row (internal) but is
+			// deliberately never returned to the caller — echoing it turns the
+			// gate into a scoring oracle a farmer can tune evasion against.
+			const verdict: { outcome: 'granted' | 'challenged' | 'denied' } = {
 				outcome: 'granted',
-				score: 0,
 			};
 			await deps.store.transaction(async (tx) => {
 				await lockSignalKeys(tx, [`user:${user.id}`, deviceHash, ipHash, cardHash]);
@@ -306,7 +333,6 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 					disposableEmail: isDisposableDomain(domain),
 					accountAgeMinutes,
 				});
-				verdict.score = score;
 
 				if (tier === 'high') {
 					verdict.outcome = 'denied';
@@ -342,7 +368,7 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 					'A free trial is not available for this account. You can still ' +
 						'subscribe without a trial (billing starts immediately), or contact ' +
 						'support if you believe this is a mistake.',
-					{ retryWith: { skipTrial: true }, score: verdict.score },
+					{ retryWith: { skipTrial: true } },
 				);
 				return;
 			}
