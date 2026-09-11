@@ -13,13 +13,16 @@ import type { ResolveRecipient } from '@fonderie/billing';
 import { MediaModule, DbBlobProvider } from '@fonderie/media';
 import { getMigrationsPath as mediaMigrationsPath } from '@fonderie/media/migrations';
 import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/migrations';
-import { mount } from '@fonderie/adapter-express';
+import { adapt, mount } from '@fonderie/adapter-express';
+import { byIp, MemoryStore, rateLimit } from '@fonderie/rate-limit';
 import express from 'express';
 
 import { getAppMigrationsPath } from './db/migrations/index.js';
 import { requireAuth } from './auth/requireAuth.js';
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
+import { captureSignupSignals, subscribeTrialEnforcement, trialCheckoutGate } from './risk/gate.js';
+import { purgeExpiredSignals } from './risk/signals.js';
 
 async function main() {
 	const app = express();
@@ -35,7 +38,12 @@ async function main() {
 			res.setHeader('Vary', 'Origin');
 			res.setHeader('Access-Control-Allow-Credentials', 'true');
 			res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-			res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+			// X-Device-Fingerprint: the optional trial-risk device signal — without
+			// it here the browser's preflight rejects any request carrying it.
+			res.setHeader(
+				'Access-Control-Allow-Headers',
+				'Content-Type, Authorization, X-Device-Fingerprint',
+			);
 		}
 		if (req.method === 'OPTIONS') {
 			res.statusCode = 204;
@@ -105,8 +113,24 @@ async function main() {
 		// hand the same instance to auth and courier. Without SMTP_HOST we skip
 		// courier entirely and degrade gracefully: auth still records pins in the DB.
 		const smtpHost = process.env.SMTP_HOST;
+		// Payments are configured below, billing's dunning/receipt notices ride
+		// this bus, and the trial gate's email-verification challenge must be
+		// DELIVERABLE. Without SMTP a production deploy would boot green while
+		// customer notices drop into a consumer-less transport and the challenge
+		// becomes a silent permanent deny — so fail the boot instead.
+		if (!smtpHost && process.env.NODE_ENV === 'production') {
+			throw new Error(
+				'SMTP_HOST is required in production: billing customer notices and the ' +
+					'trial email-verification challenge need a deliverable email path.',
+			);
+		}
 		const eventsModule = new EventsModule({ transport: new MemoryTransport() });
-		const notifyBus = smtpHost ? eventsModule.bus : undefined;
+		// The bus goes to auth + billing UNCONDITIONALLY (not only with SMTP):
+		// they publish domain events — fonderie.user.registered,
+		// fonderie.billing.subscription.* — that the trial-risk defense below
+		// subscribes to. Courier (the email consumer) stays SMTP-gated for dev
+		// convenience; production without SMTP fails the boot above.
+		const notifyBus = eventsModule.bus;
 
 		// Billing's money flows are webhook-driven (no session) — map a subscriber
 		// id to the address courier should reach for receipts / dunning / low
@@ -145,18 +169,22 @@ async function main() {
 		// src/credits system during the migration — nothing debits the wallet
 		// through billing yet, so this is additive: it creates the tables + syncs
 		// the plan catalog, but the running app is unchanged until cutover.
+		// One provider instance, shared between billing and the trial-risk gate
+		// below (the gate reads the saved card's fingerprint through it).
+		const stripeProvider = new StripeProvider(
+			process.env.STRIPE_SECRET_KEY ?? 'sk_test_placeholder',
+			process.env.STRIPE_WEBHOOK_SECRET,
+			// In-app card entry offers card only — a concrete, displayable,
+			// off-session-chargeable payment method. Excludes wallets like Link
+			// (whose type:'link' PM has no card details to show as a card on file).
+			{ setupPaymentMethodTypes: [SUPPORTED_PAYMENT_OPTIONS.CARD] },
+		);
+
 		fonderieApp = fonderieApp.register(
 			new BillingModule(
 				store,
 				{
-					provider: new StripeProvider(
-						process.env.STRIPE_SECRET_KEY ?? 'sk_test_placeholder',
-						process.env.STRIPE_WEBHOOK_SECRET,
-						// In-app card entry offers card only — a concrete, displayable,
-						// off-session-chargeable payment method. Excludes wallets like Link
-						// (whose type:'link' PM has no card details to show as a card on file).
-						{ setupPaymentMethodTypes: [SUPPORTED_PAYMENT_OPTIONS.CARD] },
-					),
+					provider: stripeProvider,
 					webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
 					plans: PLANS,
 					wallet: {
@@ -179,8 +207,8 @@ async function main() {
 			),
 		);
 
-		// Guard on smtpHost (not notifyBus) so its type narrows to string below;
-		// the two are truthy together, since notifyBus is set iff smtpHost is.
+		// Guard on smtpHost so its type narrows to string below. The bus itself
+		// always exists now — only the email consumer (courier) is SMTP-gated.
 		if (smtpHost) {
 			// Every auth message type routed to the email channel. Courier skips any
 			// whose recipient has no email address (e.g. phone-only OTP).
@@ -248,6 +276,50 @@ async function main() {
 		// mount() wires body parsing, context (bridge), and the auth routes onto
 		// Express. bridge runs first, so custom routes added below see req._fonderie.
 		mount(app, fonderie);
+
+		// ── Trial-abuse defense (src/risk/) ──────────────────────────────
+		// Routes registered between mount() and listen() run AFTER bridge()
+		// (full fonderie ctx) and BEFORE the fonderie route handler — so these
+		// compose in front of the brick routes and fall through with next().
+		const risk = { store, provider: stripeProvider };
+		// Stage 1 — record each registration attempt's velocity signals
+		// (hashed IP / device, email domain). Auth's own per-IP limiter
+		// already throttles blatant bursts; this feeds the risk score.
+		app.post('/auth/register', captureSignupSignals(risk));
+		// Stage 2 — the real gate, at the moment billing would grant
+		// plan.trialDays. Auth first (an unauthenticated flood must cost 401s,
+		// not rate-limit tokens), then a PER-USER velocity brake (per-IP would
+		// collapse to one shared bucket behind a proxy with TRUST_PROXY unset,
+		// and to an attacker-chosen key with it set on a directly-reachable
+		// app), then the risk assessment: low → fall through · medium → 402
+		// verify-email challenge · high → 409 no free trial (paid stays open).
+		app.post(
+			'/billing/checkout',
+			...requireAuth(store),
+			adapt(
+				rateLimit({
+					store: new MemoryStore(),
+					// 10 checkout attempts per user per hour — generous for humans,
+					// hostile to scripted farming. Durable cross-account velocity
+					// lives in trial_signals; this is just a per-account brake.
+					rule: { capacity: 10, refillPerSec: 10 / 3600 },
+					key: (ctx) =>
+						ctx.user?.id ? `trial-checkout:user:${ctx.user.id}` : byIp('trial-checkout')(ctx),
+				}),
+			),
+			trialCheckoutGate(risk),
+		);
+		// Stage 3 — when Stripe reports the trialing subscription and its card:
+		// promote the provisional gate row to granted and stamp the card's
+		// fingerprint hash — or, if that card already carried a trial on
+		// another account, cancel the subscription (the enforcement point the
+		// gate itself cannot reach: a fresh signup has no Stripe customer until
+		// checkout completes).
+		subscribeTrialEnforcement(notifyBus, risk);
+		// Retention purge on a timer — NOT on the request path, where an
+		// attacker who never checks out would simply never trigger it.
+		setInterval(() => purgeExpiredSignals(store), 6 * 60 * 60 * 1000).unref();
+		purgeExpiredSignals(store);
 
 		// GET /auth/me — requireAuth, returns the current user. The credit balance
 		// is NOT here anymore: it lives on the billing wallet, which the client

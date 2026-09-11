@@ -15,7 +15,7 @@ import {
 	type ScrapeTaskJob,
 } from './queue/scrapeQueue.js';
 import { scrapeGoogleMaps } from './scraper/engine.js';
-import { resolveScrapeCharge } from './billing/catalog.js';
+import { effectivePlanName, resolveScrapeCharge } from './billing/catalog.js';
 
 /**
  * Human ledger line for a completed scrape. Prefers the task's structured form
@@ -93,7 +93,9 @@ async function main() {
 				// marked 'error' rather than delivered for free. Unlimited plans have
 				// no rate (resolveScrapeCharge → null), so scraping is free for them.
 				const sub = await getSubscription('user', task.user_id, store);
-				const charge = resolveScrapeCharge(sub?.plan);
+				// Status-aware: a canceled/lapsed subscription entitles nothing — its row
+				// still names the plan, so keying on plan alone would scrape free forever.
+				const charge = resolveScrapeCharge(effectivePlanName(sub));
 				if (charge) {
 					try {
 						await debitWallet(

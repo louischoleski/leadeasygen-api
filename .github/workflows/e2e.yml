@@ -75,9 +75,15 @@ jobs:
       - run: npm ci
 
       # API tests use Playwright's request fixture only — no browser download.
+      # Start the API ONLY (dev:api), not the scrape worker: these specs drive
+      # task state directly via DB helpers (seedCompletedTask / ageTask) and
+      # assert worker-independent outcomes. Running the live worker races the
+      # tests — it picks up a just-created job and, with no scrape target in CI,
+      # flips it to 'error', which the dedup/active-job queries exclude — so a
+      # duplicate resubmit non-deterministically 201-creates instead of 409ing.
       - name: Start API, wait for health, run e2e
         run: |
-          npm run dev > api.log 2>&1 &
+          npm run dev:api > api.log 2>&1 &
           for i in $(seq 1 60); do curl -sf http://localhost:3000/health && break; sleep 2; done
           curl -sf http://localhost:3000/health || { echo "API failed to start"; cat api.log; exit 1; }
           npm run test:e2e

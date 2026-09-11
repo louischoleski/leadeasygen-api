@@ -14,16 +14,18 @@
     "lint": "oxlint",
     "typecheck": "tsc --noEmit",
     "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui"
+    "test:e2e:ui": "playwright test --ui",
+    "test": "node --import tsx --test src/risk/__tests__/*.test.ts"
   },
   "dependencies": {
     "@fonderie/adapter-express": "^5.1.5",
     "@fonderie/auth": "^7.1.1",
-    "@fonderie/billing": "^9.0.2",
+    "@fonderie/billing": "^9.1.0",
     "@fonderie/core": "^0.10.4",
     "@fonderie/courier": "^7.0.1",
     "@fonderie/events": "^5.0.6",
     "@fonderie/media": "^0.2.4",
+    "@fonderie/rate-limit": "^4.0.7",
     "@fonderie/storage": "^0.1.4",
     "@fonderie/store": "^0.3.0",
     "@fonderie/workspaces": "^6.0.3",
