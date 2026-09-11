@@ -38,9 +38,11 @@ import { scoreTrial } from './trial-risk.js';
 import {
 	cardSeenElsewhere,
 	clearPendingTrialDecision,
+	deferTrialEnforcement,
 	deviceFingerprintFrom,
 	emailDomain,
 	gatherReuseSignals,
+	hasResolvedTrialDecision,
 	hashIp,
 	hashSignal,
 	isDisposableDomain,
@@ -394,10 +396,23 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 			});
 			next();
 		} catch (err) {
-			// Fail-open: an assessment outage must not block a legitimate checkout.
-			// The card signal still gets enforced at stage 3 (webhook time).
-			console.error('trial risk gate failed (failing open):', err);
-			next();
+			// Fail-CLOSED: this gate is the only place a 'pending' enforcement row
+			// is written before billing grants the trial, and stage-3 enforcement
+			// keys off that row. If we failed open here, an assessment error
+			// (transient DB, pool exhaustion) would let billing start a trial that
+			// no pending row — and therefore no enforcement — ever covers, leaking
+			// an un-enforced (possibly reused-card) trial. A trial is not a
+			// time-critical purchase: 503-and-retry is the safe posture. Non-trial
+			// checkouts (upgrades, paid-only) never reach here — they return next()
+			// above before any of the throwing queries.
+			console.error('trial risk gate failed (failing closed):', err);
+			fail(
+				res,
+				503,
+				'TRIAL_GATE_UNAVAILABLE',
+				'We could not start your free trial right now. Please try again in a moment.',
+				{ retryable: true },
+			);
 		}
 	};
 }
@@ -434,19 +449,26 @@ export async function enforceTrialForUser(
 	deps: TrialRiskDeps,
 	userId: string,
 ): Promise<EnforceOutcome> {
-	// Source of truth is the stored subscription, not the event.
+	// Source of truth is the stored subscription (unique per subscriber), not
+	// the event. fonderie_subscriptions has UNIQUE (subscriber_type,
+	// subscriber_id), so this is the one row.
 	const [sub] = await deps.store.query<{
 		status: string;
 		provider_subscription_id: string | null;
 	}>(
 		`SELECT status, provider_subscription_id FROM fonderie_subscriptions
-		 WHERE subscriber_type = 'user' AND subscriber_id = $1
-		 ORDER BY created_at DESC LIMIT 1`,
+		 WHERE subscriber_type = 'user' AND subscriber_id = $1`,
 		[userId],
 	);
 	if (!sub || sub.status !== 'trialing') return 'skip'; // not a trial (yet), or already resolved
 
-	// Anything still to decide? (cheap idempotency check before the Stripe call)
+	// Already resolved? A user gets one trial ever (billing's own guard), so a
+	// granted/denied row means enforcement is done — idempotent no-op.
+	if (await hasResolvedTrialDecision(deps.store, userId)) return 'skip';
+
+	// Something still pending to decide? (the gate always writes one before
+	// billing grants the trial — the gate fails CLOSED otherwise, so a trialing
+	// sub with no pending row is an anomaly the sweep leaves alone.)
 	const [pending] = await deps.store.query<{ one: number }>(
 		`SELECT 1 AS one FROM trial_signals
 		 WHERE kind = 'trial' AND decision = 'pending' AND user_id = $1 LIMIT 1`,
@@ -455,43 +477,75 @@ export async function enforceTrialForUser(
 	if (!pending) return 'skip';
 
 	// The card this checkout collected. Null = unknown (transient error OR not
-	// attached yet) — fail closed and let the sweep retry; never grant blind.
+	// attached yet) — fail closed: back off and let the sweep retry, never grant
+	// blind.
 	const cardHash = await subscriptionCardFingerprintHash(deps, userId);
-	if (!cardHash) return 'deferred';
+	if (!cardHash) {
+		await deferTrialEnforcement(deps.store, userId);
+		return 'deferred';
+	}
 
-	return deps.store.transaction(async (tx) => {
-		// Serialize every enforcement that touches THIS card so the reuse check
-		// and the stamp are atomic across accounts.
+	// DECIDE under a card-hash advisory lock — serialized across accounts so two
+	// same-card checkouts can't both pass the reuse check. NO external call
+	// inside the transaction (that would pin a pooled connection + the lock
+	// across a Stripe round-trip); the cancel happens after commit.
+	const decision = await deps.store.transaction(async (tx): Promise<'granted' | 'reuse' | 'skip'> => {
 		await tx.query('SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))', [
 			`trial-card:${cardHash}`,
 		]);
-		// Re-check under the lock: a concurrent enforcement may have resolved it.
 		const [stillPending] = await tx.query<{ one: number }>(
 			`SELECT 1 AS one FROM trial_signals
 			 WHERE kind = 'trial' AND decision = 'pending' AND user_id = $1 LIMIT 1`,
 			[userId],
 		);
 		if (!stillPending) return 'skip';
-
 		if (!(await cardSeenElsewhere(tx, cardHash, userId))) {
 			await promotePendingToGranted(tx, userId, cardHash);
 			return 'granted';
 		}
-
-		// Reused. Cancel the day-0 trial subscription (id from the DB, robust to
-		// a missing event field). No id yet → defer; never grant a reused card.
-		const subId = sub.provider_subscription_id;
-		if (!subId) return 'deferred';
-		// Awaited before the mark and inside the tx: a throw rolls the whole
-		// thing back (row stays pending, sweep retries) rather than leaving the
-		// subscription live and the decision silently swallowed.
-		await deps.provider.cancelSubscription({ subscriptionId: subId, atPeriodEnd: false });
-		await markTrialRevoked(tx, userId, cardHash);
-		console.error(
-			`trial risk: REVOKED trial for user ${userId} — card already used by another account's trial`,
-		);
-		return 'revoked';
+		return 'reuse'; // decided reused; the row stays pending until the cancel confirms
 	});
+	if (decision !== 'reuse') return decision;
+
+	// REVOKE, outside the lock/transaction. The row is still 'pending', so a
+	// failed cancel simply gets retried by the sweep — the subscription is never
+	// left silently live-and-granted, and no un-enforced trial slips through.
+	const subId = sub.provider_subscription_id;
+	if (!subId) {
+		await deferTrialEnforcement(deps.store, userId); // billing hasn't stored the id yet
+		return 'deferred';
+	}
+	try {
+		await deps.provider.cancelSubscription({ subscriptionId: subId, atPeriodEnd: false });
+	} catch (err) {
+		// "Already canceled" means our earlier attempt (whose mark then failed)
+		// actually worked — treat as success and fall through to mark denied.
+		// Any other error: back off and let the sweep retry the cancel
+		// idempotently (never mark denied while the sub may still be live).
+		if (!isAlreadyCanceled(err)) {
+			console.error(`trial risk: cancel failed for user ${userId}, will retry:`, err);
+			await deferTrialEnforcement(deps.store, userId);
+			return 'deferred';
+		}
+	}
+	await markTrialRevoked(deps.store, userId, cardHash); // pending → denied
+	console.error(
+		`trial risk: REVOKED trial for user ${userId} — card already used by another account's trial`,
+	);
+	return 'revoked';
+}
+
+/** Stripe surfaces canceling an already-canceled/absent subscription as an
+ * error; that state is our success condition on a retry, so recognize it
+ * rather than looping. Matches on the provider's message (kept broad). */
+function isAlreadyCanceled(err: unknown): boolean {
+	const msg = (err as { message?: string })?.message?.toLowerCase() ?? '';
+	return (
+		msg.includes('already canceled') ||
+		msg.includes('already cancelled') ||
+		msg.includes('no such subscription') ||
+		msg.includes('canceled subscription')
+	);
 }
 
 /**
@@ -541,7 +595,10 @@ export function startTrialReconciliation(
 				  WHERE ts.kind = 'trial' AND ts.decision = 'pending'
 				    AND s.status = 'trialing'
 				    AND ts.created_at < now() - interval '30 seconds'
-				  ORDER BY ts.created_at ASC
+				    AND (ts.next_attempt_at IS NULL OR ts.next_attempt_at <= now())
+				  -- Never-attempted rows (NULL) first, so a batch of stuck/deferring
+				  -- rows can't starve a fresh reused-card row out of the window.
+				  ORDER BY ts.next_attempt_at ASC NULLS FIRST, ts.created_at ASC
 				  LIMIT 50`,
 			);
 			for (const r of rows) {

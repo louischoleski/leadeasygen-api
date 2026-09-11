@@ -199,6 +199,37 @@ export async function clearPendingTrialDecision(
 	);
 }
 
+/** Has this user's trial already been resolved to a durable outcome? Used by
+ * enforcement to short-circuit idempotently (a user gets at most one trial in
+ * their lifetime — billing's fonderie_subscription_trials enforces that). */
+export async function hasResolvedTrialDecision(
+	store: Queryable,
+	userId: string,
+): Promise<boolean> {
+	const rows = await store.query<{ one: number }>(
+		`SELECT 1 AS one FROM trial_signals
+		 WHERE kind = 'trial' AND user_id = $1 AND decision IN ('granted', 'denied') LIMIT 1`,
+		[userId],
+	);
+	return rows.length > 0;
+}
+
+/** Back off a still-pending enforcement so the reconciliation sweep doesn't
+ * re-hit it every tick (which would starve fresh rows). next_attempt_at is
+ * pushed into the future; the sweep processes never-attempted (NULL) rows
+ * first, so deferring rows never crowd out new ones. */
+export async function deferTrialEnforcement(
+	store: Queryable,
+	userId: string,
+	backoff = '5 minutes',
+): Promise<void> {
+	await store.query(
+		`UPDATE trial_signals SET next_attempt_at = now() + interval '${backoff}'
+		 WHERE kind = 'trial' AND decision = 'pending' AND user_id = $1`,
+		[userId],
+	);
+}
+
 /** The subscription webhook's promotion: the trial REALLY started. Flip the
  * pending row to a durable granted record and stamp the card fingerprint
  * Stripe just reported. Falls back to stamping the newest granted row missing
