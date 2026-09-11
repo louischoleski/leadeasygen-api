@@ -54,6 +54,13 @@ export function hashSignal(kind: 'ip' | 'device' | 'card' | 'domain', value: str
 export function ipBucket(ip: string): string {
 	if (!ip.includes(':')) return ip;
 	const [head] = ip.split('%');
+	// IPv4-mapped IPv6 (::ffff:a.b.c.d) is an IPv4 address wearing a v6 hat —
+	// return the embedded IPv4 whole (as @fonderie/core's resolveClientIp
+	// already does upstream). Without this the dotted-quad tail stays one
+	// "group", so slice(0,4) yields 0:0:0:0::/64 for EVERY such client,
+	// merging unrelated users into one velocity bucket.
+	const v4Mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(head ?? '');
+	if (v4Mapped) return v4Mapped[1] as string;
 	const groups = (head ?? '').split('::');
 	let left = groups[0] ? groups[0].split(':') : [];
 	const right = groups[1] ? groups[1].split(':') : [];

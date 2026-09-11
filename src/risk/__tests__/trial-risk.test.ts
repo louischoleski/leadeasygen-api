@@ -104,6 +104,14 @@ test('ipBucket: compressed :: forms expand consistently', () => {
 	assert.equal(ipBucket('2001:db8::1'), ipBucket('2001:db8:0:0:0:0:0:2'));
 });
 
+test('ipBucket: IPv4-mapped IPv6 resolves to its IPv4 — distinct clients stay distinct', () => {
+	assert.equal(ipBucket('::ffff:203.0.113.7'), '203.0.113.7');
+	// Two different mapped IPv4s must NOT collapse into one bucket.
+	assert.notEqual(ipBucket('::ffff:203.0.113.7'), ipBucket('::ffff:198.51.100.9'));
+	// And a mapped address buckets identically to the bare IPv4.
+	assert.equal(ipBucket('::ffff:203.0.113.7'), ipBucket('203.0.113.7'));
+});
+
 // ── hashing ───────────────────────────────────────────────────────
 
 test('hashSignal: deterministic and domain-separated', () => {
