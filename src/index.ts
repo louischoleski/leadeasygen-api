@@ -21,7 +21,12 @@ import { getAppMigrationsPath } from './db/migrations/index.js';
 import { requireAuth } from './auth/requireAuth.js';
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
-import { captureSignupSignals, subscribeTrialEnforcement, trialCheckoutGate } from './risk/gate.js';
+import {
+	captureSignupSignals,
+	startTrialReconciliation,
+	subscribeTrialEnforcement,
+	trialCheckoutGate,
+} from './risk/gate.js';
 import { purgeExpiredSignals } from './risk/signals.js';
 
 async function main() {
@@ -316,6 +321,10 @@ async function main() {
 		// gate itself cannot reach: a fresh signup has no Stripe customer until
 		// checkout completes).
 		subscribeTrialEnforcement(notifyBus, risk);
+		// Durability backstop: the in-process bus is at-most-once, so a dropped
+		// event / transient error / unattached card / crash would otherwise leave
+		// a trial un-enforced. The sweep re-runs enforcement idempotently.
+		startTrialReconciliation(risk);
 		// Retention purge on a timer — NOT on the request path, where an
 		// attacker who never checks out would simply never trigger it.
 		setInterval(() => purgeExpiredSignals(store), 6 * 60 * 60 * 1000).unref();

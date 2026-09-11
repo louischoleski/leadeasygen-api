@@ -404,65 +404,156 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 
 // ── stage 3: webhook-time promotion + enforcement ─────────────────
 
+export type EnforceOutcome = 'granted' | 'revoked' | 'deferred' | 'skip';
+
 /**
- * Subscribe on the shared events bus. When billing reports a subscription
- * that is TRIALING, resolve the card the checkout just collected and:
+ * Resolve a single user's provisional ('pending') trial decision — the real
+ * cross-account card defense. At gate time a fresh signup has no Stripe
+ * customer, so the card can only be judged here, once checkout has collected
+ * it. IDEMPOTENT and fail-CLOSED, so it is safe to call from both the
+ * subscription webhook (low latency) and the reconciliation sweep (durability
+ * against the at-most-once, non-durable event transport).
  *
- *  - if that card's fingerprint already carries a trial on ANOTHER account →
- *    revoke: cancel the subscription immediately (nothing has been charged —
- *    it is day 0 of a trial) and mark the decision denied. This is the real
- *    cross-account card defense: at gate time a fresh signup has no Stripe
- *    customer yet, so only this point can see the card.
- *  - otherwise promote the provisional 'pending' row to 'granted' and stamp
- *    the fingerprint hash, so the NEXT account presenting this card scores
- *    cardFingerprintSeen.
+ * Correctness rules that fixed the audit's critical findings:
+ *  - Serializes on a CARD-hash advisory lock (not per-user): two accounts
+ *    sharing one card that check out concurrently no longer both pass the
+ *    reuse check before either stamps — they run one at a time, so the second
+ *    sees the first's stamped row and is revoked.
+ *  - Reads the subscription (status + provider id) from the DB, never the
+ *    event payload — a missing/odd event field can't turn enforcement into a
+ *    silent grant.
+ *  - If the card can't be resolved (transient Stripe/DB error, or not attached
+ *    yet) → DEFER: leave the row pending and let the sweep retry. Never
+ *    promote an un-enforced trial.
+ *  - Revoke = cancel FIRST, mark denied only on success, both inside the
+ *    locked transaction: a cancel failure rolls back (nothing written, row
+ *    stays pending) and the sweep retries — the subscription is never left
+ *    live-and-marked-granted.
+ */
+export async function enforceTrialForUser(
+	deps: TrialRiskDeps,
+	userId: string,
+): Promise<EnforceOutcome> {
+	// Source of truth is the stored subscription, not the event.
+	const [sub] = await deps.store.query<{
+		status: string;
+		provider_subscription_id: string | null;
+	}>(
+		`SELECT status, provider_subscription_id FROM fonderie_subscriptions
+		 WHERE subscriber_type = 'user' AND subscriber_id = $1
+		 ORDER BY created_at DESC LIMIT 1`,
+		[userId],
+	);
+	if (!sub || sub.status !== 'trialing') return 'skip'; // not a trial (yet), or already resolved
+
+	// Anything still to decide? (cheap idempotency check before the Stripe call)
+	const [pending] = await deps.store.query<{ one: number }>(
+		`SELECT 1 AS one FROM trial_signals
+		 WHERE kind = 'trial' AND decision = 'pending' AND user_id = $1 LIMIT 1`,
+		[userId],
+	);
+	if (!pending) return 'skip';
+
+	// The card this checkout collected. Null = unknown (transient error OR not
+	// attached yet) — fail closed and let the sweep retry; never grant blind.
+	const cardHash = await subscriptionCardFingerprintHash(deps, userId);
+	if (!cardHash) return 'deferred';
+
+	return deps.store.transaction(async (tx) => {
+		// Serialize every enforcement that touches THIS card so the reuse check
+		// and the stamp are atomic across accounts.
+		await tx.query('SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))', [
+			`trial-card:${cardHash}`,
+		]);
+		// Re-check under the lock: a concurrent enforcement may have resolved it.
+		const [stillPending] = await tx.query<{ one: number }>(
+			`SELECT 1 AS one FROM trial_signals
+			 WHERE kind = 'trial' AND decision = 'pending' AND user_id = $1 LIMIT 1`,
+			[userId],
+		);
+		if (!stillPending) return 'skip';
+
+		if (!(await cardSeenElsewhere(tx, cardHash, userId))) {
+			await promotePendingToGranted(tx, userId, cardHash);
+			return 'granted';
+		}
+
+		// Reused. Cancel the day-0 trial subscription (id from the DB, robust to
+		// a missing event field). No id yet → defer; never grant a reused card.
+		const subId = sub.provider_subscription_id;
+		if (!subId) return 'deferred';
+		// Awaited before the mark and inside the tx: a throw rolls the whole
+		// thing back (row stays pending, sweep retries) rather than leaving the
+		// subscription live and the decision silently swallowed.
+		await deps.provider.cancelSubscription({ subscriptionId: subId, atPeriodEnd: false });
+		await markTrialRevoked(tx, userId, cardHash);
+		console.error(
+			`trial risk: REVOKED trial for user ${userId} — card already used by another account's trial`,
+		);
+		return 'revoked';
+	});
+}
+
+/**
+ * Low-latency path: enforce as soon as billing reports the trialing
+ * subscription. Thin wrapper over the idempotent enforceTrialForUser; the
+ * sweep below is the durability backstop for anything this misses (dropped
+ * at-most-once event, transient error, card not attached yet, a crash).
  */
 export function subscribeTrialEnforcement(bus: EventBus, deps: TrialRiskDeps): void {
 	bus.on(
 		EVENT_KEYS.subscriptionCreated,
 		async (payload: unknown) => {
 			try {
-				const p = payload as {
-					subscriberType?: string;
-					subscriberId?: string;
-					status?: string;
-					providerSubscriptionId?: string | null;
-				};
-				if (p.subscriberType !== 'user' || !p.subscriberId || p.status !== 'trialing') return;
-
-				const cardHash = await subscriptionCardFingerprintHash(deps, p.subscriberId);
-				if (!cardHash) {
-					// Trial is real regardless — promote so velocity signals stay
-					// truthful; without a fingerprint there is nothing to compare.
-					console.warn(
-						`trial risk: no card fingerprint resolvable for trialing user ${p.subscriberId} — promoting without card stamp`,
-					);
-					await promotePendingToGranted(deps.store, p.subscriberId, null);
-					return;
-				}
-
-				const reused = await cardSeenElsewhere(deps.store, cardHash, p.subscriberId);
-				if (reused && p.providerSubscriptionId) {
-					await deps.provider.cancelSubscription({
-						subscriptionId: p.providerSubscriptionId,
-						atPeriodEnd: false,
-					});
-					await markTrialRevoked(deps.store, p.subscriberId, cardHash);
-					console.error(
-						`trial risk: REVOKED trial for user ${p.subscriberId} — card fingerprint already used by another account's trial`,
-					);
-					return;
-				}
-				if (reused) {
-					console.error(
-						`trial risk: card reuse detected for user ${p.subscriberId} but no providerSubscriptionId to cancel — promoting with stamp; investigate`,
-					);
-				}
-				await promotePendingToGranted(deps.store, p.subscriberId, cardHash);
+				const p = payload as { subscriberType?: string; subscriberId?: string };
+				if (p.subscriberType !== 'user' || !p.subscriberId) return;
+				await enforceTrialForUser(deps, p.subscriberId);
 			} catch (err) {
-				console.error('trial enforcement failed:', err);
+				console.error('trial enforcement (event) failed:', err);
 			}
 		},
 		'leadeasygen.trial-risk.enforcement',
 	);
+}
+
+/**
+ * Durable reconciliation: the event bus is in-process and at-most-once, so a
+ * dropped event, a transient Stripe/DB error, an unattached-card defer, or a
+ * crash would otherwise leave a trial un-enforced forever. This sweep re-runs
+ * enforceTrialForUser (idempotent) for every still-pending trial whose
+ * subscription is trialing, catching all of those. Returns a stop handle.
+ */
+export function startTrialReconciliation(
+	deps: TrialRiskDeps,
+	intervalMs = 60_000,
+): () => void {
+	const tick = async (): Promise<void> => {
+		try {
+			// created_at grace lets the low-latency event handler win the happy
+			// path; LIMIT bounds the scan. Pending rows past their 24h TTL are
+			// left for the purge (a fingerprint that never resolved can't be
+			// enforced).
+			const rows = await deps.store.query<{ user_id: string }>(
+				`SELECT ts.user_id
+				   FROM trial_signals ts
+				   JOIN fonderie_subscriptions s
+				     ON s.subscriber_type = 'user' AND s.subscriber_id = ts.user_id
+				  WHERE ts.kind = 'trial' AND ts.decision = 'pending'
+				    AND s.status = 'trialing'
+				    AND ts.created_at < now() - interval '30 seconds'
+				  ORDER BY ts.created_at ASC
+				  LIMIT 50`,
+			);
+			for (const r of rows) {
+				await enforceTrialForUser(deps, r.user_id).catch((err) =>
+					console.error(`trial reconciliation: enforce failed for ${r.user_id}:`, err),
+				);
+			}
+		} catch (err) {
+			console.error('trial reconciliation sweep failed:', err);
+		}
+	};
+	const handle = setInterval(() => void tick(), intervalMs);
+	handle.unref();
+	return () => clearInterval(handle);
 }
