@@ -32,7 +32,13 @@ export interface TrialRiskResult {
 
 export function scoreTrial(s: TrialRiskSignals): TrialRiskResult {
 	let score = 0;
-	if (s.cardFingerprintSeen) score += 60; // strongest signal
+	// Strongest signal, and alone already 'high' (75 > 70): a card that has
+	// been through a trial gets no second free trial, period — per the spec's
+	// "very high risk → don't offer another free trial". This is safe for the
+	// false-positive case (a family sharing a card) because 'high' is not a
+	// lockout: the paid, no-trial checkout stays open (the gate's skipTrial
+	// path), which is exactly the intended business outcome for a shared card.
+	if (s.cardFingerprintSeen) score += 75;
 	if (s.radarRisk === 'elevated') score += 25;
 	if (s.signupsFromDevice1h > 3) score += 30;
 	if (s.deviceFingerprintSeen) score += 25;

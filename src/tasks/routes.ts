@@ -6,7 +6,7 @@ import { getSubscription, getWalletStatus, requireWalletBalance } from '@fonderi
 import { adapt } from '@fonderie/adapter-express';
 
 import { requireAuth } from '../auth/requireAuth.js';
-import { resolveActiveJobsLimit } from '../billing/catalog.js';
+import { effectivePlanName, resolveActiveJobsLimit } from '../billing/catalog.js';
 import { enqueueScrapeTask } from '../queue/scrapeQueue.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -230,7 +230,7 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 		// (a failed scrape never costs the user), and that debit is the
 		// authoritative floor.
 		try {
-			const activeLimit = resolveActiveJobsLimit((await getSubscription('user', userId, store))?.plan);
+			const activeLimit = resolveActiveJobsLimit(effectivePlanName(await getSubscription('user', userId, store)));
 			const outcome = await store.transaction(async (tx) => {
 				await lockUser(tx, userId);
 				// Duplicate check first: it's the more actionable signal (points the
@@ -306,7 +306,7 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 		// is a fresh active task, so it counts against activeJobs like a create
 		// (the failed original is 'error' — never in the active count).
 		try {
-			const activeLimit = resolveActiveJobsLimit((await getSubscription('user', userId, store))?.plan);
+			const activeLimit = resolveActiveJobsLimit(effectivePlanName(await getSubscription('user', userId, store)));
 			const outcome = await store.transaction(async (tx) => {
 				await lockUser(tx, userId);
 				const rows = await tx.query<Pick<TaskRow, 'id' | 'url' | 'limit' | 'status' | 'params'> & { superseded_by: string | null }>(

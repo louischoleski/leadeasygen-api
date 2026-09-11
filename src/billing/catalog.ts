@@ -41,9 +41,11 @@ export const PLANS: IBillingPlan[] = [
 		description: 'Unlimited leads, no credit limits',
 		// 14 days free, card up-front (checkout collects it). Billing's own
 		// guard stops the SAME subscriber re-farming the trial; the app's
-		// trial-risk gate on POST /billing/checkout (src/risk/gate.ts) stops
-		// the cross-ACCOUNT version — new signups reusing a card/device that
-		// already got one.
+		// trial-risk defense (src/risk/gate.ts) stops the cross-ACCOUNT
+		// version: velocity/device signals at checkout time, and the card
+		// check at WEBHOOK time (a fresh signup has no Stripe customer until
+		// checkout completes, so a reused card is caught when Stripe reports
+		// the trialing subscription — and that trial is revoked).
 		trialDays: 14,
 		monthly: { amount: 4900n, priceId: process.env.STRIPE_PRICE_UNLIMITED_MONTHLY ?? '' },
 		yearly: { amount: 46800n, priceId: process.env.STRIPE_PRICE_UNLIMITED_YEARLY ?? '' },
@@ -94,6 +96,26 @@ export interface ScrapeCharge {
  * would supply, for exactly this one metered debit. Defaulting matches
  * resolvePlanWallet (plan → global → hardcoded).
  */
+// A subscription grants its plan's benefits only while it is in one of these
+// states. 'past_due' is deliberate grace (dunning is running; billing sends
+// payment-failed notices). Everything else — canceled, incomplete, paused —
+// gets the free tier: a canceled trial MUST NOT keep plan='unlimited'
+// entitlements just because the fonderie_subscriptions row still names the
+// plan (the row's plan column is never rewritten on cancel; its status is).
+const ENTITLED_STATUSES = new Set(['active', 'trialing', 'past_due']);
+
+/**
+ * The plan name a subscription row actually entitles its holder to — the
+ * status-aware front door that resolveScrapeCharge / resolveActiveJobsLimit
+ * callers MUST go through. null (→ free tier) when there is no subscription
+ * or it is not in an entitled state.
+ */
+export function effectivePlanName(
+	sub: { plan: string; status: string } | null | undefined,
+): string | null {
+	return sub && ENTITLED_STATUSES.has(sub.status) ? sub.plan : null;
+}
+
 /**
  * The plan's cap on simultaneously active (pending/scraping) scrape tasks,
  * from the same catalog policy. null = uncapped (Unlimited). Plan-name

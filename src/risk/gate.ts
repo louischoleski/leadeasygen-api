@@ -4,14 +4,22 @@
 // fingerprint), auth (account age, email verification), the request (IP,
 // device header), and the app's own trial_signals memory.
 //
-// Two stages:
+// Three stages:
 //   stage 1 (signup)    — captureSignupSignals on POST /auth/register records
-//                         cheap velocity signals; blatant burst abuse is
-//                         already rate-limited inside @fonderie/auth.
+//                         velocity signals for SUCCESSFUL registrations.
 //   stage 2 (trial)     — trialCheckoutGate on POST /billing/checkout, the
 //                         moment billing would grant plan.trialDays. Low risk
-//                         passes through; medium is CHALLENGED (verify your
-//                         email), high gets no free trial.
+//                         passes through (a provisional 'pending' row); medium
+//                         is CHALLENGED (verify your email); high gets no free
+//                         trial but CAN still subscribe paid (skipTrial).
+//   stage 3 (webhook)   — subscribeTrialEnforcement: when Stripe reports the
+//                         trialing subscription and its card, promote the
+//                         pending row to granted — or, if that card already
+//                         carried a trial on another account, revoke the
+//                         subscription. This is the ENFORCEMENT point for the
+//                         card signal: at gate time a fresh signup has no
+//                         Stripe customer yet, so the card can only be judged
+//                         after checkout collects it.
 //
 // The gate exploits the adapter's mount() ordering: bridge() runs at mount
 // time but the fonderie route handler is only appended at listen() — so
@@ -21,19 +29,23 @@ import type { NextFunction } from 'express';
 import type { ExpressRequest, ExpressResponse } from '@fonderie/adapter-express';
 import type { IStoreAdapter } from '@fonderie/store/types';
 import type { StripeProvider } from '@fonderie/billing';
+import { EVENT_KEYS } from '@fonderie/billing';
 import type { EventBus } from '@fonderie/events';
 
 import type { AuthedUser } from '../auth/requireAuth.js';
 import { PLANS } from '../billing/catalog.js';
 import { scoreTrial } from './trial-risk.js';
 import {
-	backfillCardFingerprint,
+	cardSeenElsewhere,
+	clearPendingTrialDecision,
 	deviceFingerprintFrom,
 	emailDomain,
 	gatherReuseSignals,
+	hashIp,
 	hashSignal,
 	isDisposableDomain,
-	purgeExpiredSignals,
+	markTrialRevoked,
+	promotePendingToGranted,
 	recordSignupSignals,
 	recordTrialDecision,
 } from './signals.js';
@@ -42,6 +54,17 @@ interface TrialRiskDeps {
 	store: IStoreAdapter;
 	provider: StripeProvider;
 }
+
+// Billing's own live-subscription set (see its checkout controller): a
+// subscriber in any of these states gets an in-place plan change or a billing
+// error — never a new trial — so the gate must not score them.
+const LIVE_SUBSCRIPTION_STATUSES = new Set([
+	'active',
+	'trialing',
+	'past_due',
+	'unpaid',
+	'paused',
+]);
 
 function clientIp(req: ExpressRequest): string | null {
 	const ip = req._fonderie?.meta['clientIp'];
@@ -52,31 +75,48 @@ function headers(req: ExpressRequest): Record<string, unknown> {
 	return (req as { headers?: Record<string, unknown> }).headers ?? {};
 }
 
-function json(res: ExpressResponse, status: number, body: unknown): void {
+// The fonderie API envelope — the shape @fonderie/client's FonderieApiError
+// and the shipped screens parse. Everything else in this app answers with it;
+// the gate must too or the challenge UX renders `undefined` toasts.
+function fail(
+	res: ExpressResponse,
+	status: number,
+	reason: string,
+	explanation: string,
+	details?: Record<string, unknown>,
+): void {
 	res.statusCode = status;
 	res.setHeader('content-type', 'application/json');
-	res.end(JSON.stringify(body));
+	res.end(JSON.stringify({ reason, explanation, ...(details ? { details } : {}) }));
 }
 
 // ── stage 1: signup capture ───────────────────────────────────────
 
 /**
  * Register on POST /auth/register (between mount() and listen()). Records the
- * ATTEMPT's velocity signals — hashed IP, hashed device fingerprint, email
- * domain — and always falls through to auth's controller. Fire-and-forget: a
- * signals hiccup must never break registration.
+ * velocity signals — hashed IP, hashed device fingerprint, hashed email
+ * domain — for registrations that SUCCEED (response < 400), by deferring the
+ * write to the response 'finish' event. Failed/throttled attempts write
+ * nothing: recording raw attempts would hand unauthenticated floods an
+ * unthrottled table write (auth's own limiter runs INSIDE the fonderie
+ * handler, after this middleware). Fire-and-forget: a signals hiccup must
+ * never break registration.
  */
 export function captureSignupSignals(deps: TrialRiskDeps) {
-	return (req: ExpressRequest, _res: ExpressResponse, next: NextFunction): void => {
+	return (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
 		try {
 			const ip = clientIp(req);
 			const device = deviceFingerprintFrom(headers(req));
 			const email = (req.body as { email?: unknown } | undefined)?.email;
-			void recordSignupSignals(deps.store, {
-				ipHash: ip ? hashSignal('ip', ip) : null,
-				deviceHash: device ? hashSignal('device', device) : null,
-				emailDomain: emailDomain(typeof email === 'string' ? email : null),
-			}).catch((err) => console.error('trial_signals signup capture failed:', err));
+			const domain = emailDomain(typeof email === 'string' ? email : null);
+			(res as unknown as NodeJS.EventEmitter).once('finish', () => {
+				if (res.statusCode >= 400) return;
+				void recordSignupSignals(deps.store, {
+					ipHash: ip ? hashIp(ip) : null,
+					deviceHash: device ? hashSignal('device', device) : null,
+					emailDomainHash: domain ? hashSignal('domain', domain) : null,
+				}).catch((err) => console.error('trial_signals signup capture failed:', err));
+			});
 		} catch (err) {
 			console.error('trial_signals signup capture failed:', err);
 		}
@@ -84,17 +124,15 @@ export function captureSignupSignals(deps: TrialRiskDeps) {
 	};
 }
 
-// ── the card-on-file lookup (strongest signal) ────────────────────
+// ── the card-on-file lookups ──────────────────────────────────────
 
 /**
- * Resolve the caller's saved card, if any, and return the peppered hash of
- * its Stripe fingerprint. Wallet customer first (it knows the consented card
- * id from a pack purchase), then the subscription's customer. Tolerant: any
- * miss degrades to null and the score leans on the other signals.
- *
- * `fingerprint` is read structurally: it ships in @fonderie/billing after the
- * card-fingerprint field-add (PR #278); on an older billing it is simply
- * absent and this resolves null.
+ * Gate-time lookup (opportunistic, wallet-first): a caller who previously
+ * bought a credit pack has a consented card the wallet knows. A FRESH signup
+ * has no Stripe customer at all yet — checkout creates it after the gate — so
+ * null here is the NORMAL case, not a defense: the card signal's enforcement
+ * point is stage 3. Null also means "unknown" (billing's lookup is tolerant/
+ * fail-open), never "verified clean".
  */
 async function cardFingerprintHash(deps: TrialRiskDeps, userId: string): Promise<string | null> {
 	try {
@@ -111,7 +149,8 @@ async function cardFingerprintHash(deps: TrialRiskDeps, userId: string): Promise
 		if (!customerId) {
 			const [sub] = await deps.store.query<{ provider_customer_id: string | null }>(
 				`SELECT provider_customer_id FROM fonderie_subscriptions
-				 WHERE subscriber_type = 'user' AND subscriber_id = $1 LIMIT 1`,
+				 WHERE subscriber_type = 'user' AND subscriber_id = $1
+				 ORDER BY created_at DESC LIMIT 1`,
 				[userId],
 			);
 			customerId = sub?.provider_customer_id ?? null;
@@ -119,7 +158,7 @@ async function cardFingerprintHash(deps: TrialRiskDeps, userId: string): Promise
 		}
 		if (!customerId) return null;
 		const card = await deps.provider.getPaymentMethod({ customerId, paymentMethodId });
-		const fingerprint = (card as { fingerprint?: string | null } | null)?.fingerprint;
+		const fingerprint = card?.fingerprint;
 		return typeof fingerprint === 'string' && fingerprint.length > 0
 			? hashSignal('card', fingerprint)
 			: null;
@@ -129,14 +168,58 @@ async function cardFingerprintHash(deps: TrialRiskDeps, userId: string): Promise
 	}
 }
 
+/**
+ * Webhook-time lookup (subscription-first): the card THIS checkout collected
+ * lives on the subscription's customer as its default/newest method. The
+ * wallet's consented pack-purchase card may be a different physical card, so
+ * it is deliberately NOT preferred here.
+ */
+async function subscriptionCardFingerprintHash(
+	deps: TrialRiskDeps,
+	subscriberId: string,
+): Promise<string | null> {
+	try {
+		const [sub] = await deps.store.query<{ provider_customer_id: string | null }>(
+			`SELECT provider_customer_id FROM fonderie_subscriptions
+			 WHERE subscriber_type = 'user' AND subscriber_id = $1
+			 ORDER BY created_at DESC LIMIT 1`,
+			[subscriberId],
+		);
+		const customerId = sub?.provider_customer_id ?? null;
+		if (!customerId) return null;
+		const card = await deps.provider.getPaymentMethod({ customerId, paymentMethodId: null });
+		const fingerprint = card?.fingerprint;
+		return typeof fingerprint === 'string' && fingerprint.length > 0
+			? hashSignal('card', fingerprint)
+			: null;
+	} catch (err) {
+		console.error('trial risk: subscription card lookup failed:', err);
+		return null;
+	}
+}
+
 // ── stage 2: the trial checkout gate ──────────────────────────────
+
+/** Serialize the assessment on every identity it reads: parallel checkouts
+ * sharing a user/device/IP/card take the same transaction-scoped advisory
+ * locks and run one at a time, so N-at-once can't all read "no prior trial".
+ * Keys are sorted for a deterministic lock order (no deadlocks). */
+async function lockSignalKeys(
+	tx: Pick<IStoreAdapter, 'query'>,
+	keys: Array<string | null>,
+): Promise<void> {
+	const present = keys.filter((k): k is string => k !== null).sort();
+	for (const key of present) {
+		await tx.query('SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))', [key]);
+	}
+}
 
 /**
  * Register on POST /billing/checkout after ...requireAuth(store), so
  * `req.user` is present. Bites ONLY when billing would actually grant a
- * trial: the requested plan carries trialDays and this subscriber has never
- * consumed one (billing's own same-account guard) — every other checkout
- * falls straight through.
+ * trial: the requested plan carries trialDays, the subscriber has no LIVE
+ * subscription (billing would do an in-place change, not a trial), and they
+ * have never consumed a trial — every other checkout falls straight through.
  */
 export function trialCheckoutGate(deps: TrialRiskDeps) {
 	return async (
@@ -148,11 +231,30 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 			const user = req.user;
 			if (!user) return next(); // requireAuth handles auth; never double-guard
 
-			const planName = (req.body as { plan?: unknown } | undefined)?.plan;
+			const body = (req.body ?? {}) as { plan?: unknown; skipTrial?: unknown };
 			const plan = PLANS.find(
-				(p) => typeof planName === 'string' && p.name.toLowerCase() === planName.toLowerCase(),
+				(p) => typeof body.plan === 'string' && p.name.toLowerCase() === body.plan.toLowerCase(),
 			);
-			if (plan?.trialDays === undefined) return next(); // no trial at stake
+			if (!plan?.trialDays) return next(); // no trial at stake (absent or 0)
+
+			// Billing's live-subscription branch never grants a trial (in-place
+			// change / its own 422s) — replicate it so paid upgrades are never
+			// risk-scored, challenged, or recorded as trials.
+			const [current] = await deps.store.query<{
+				status: string;
+				provider_subscription_id: string | null;
+			}>(
+				`SELECT status, provider_subscription_id FROM fonderie_subscriptions
+				 WHERE subscriber_type = 'user' AND subscriber_id = $1
+				 ORDER BY created_at DESC LIMIT 1`,
+				[user.id],
+			);
+			if (
+				current?.provider_subscription_id &&
+				LIVE_SUBSCRIPTION_STATUSES.has(current.status)
+			) {
+				return next();
+			}
 
 			const consumed = await deps.store.query<{ one: number }>(
 				`SELECT 1 AS one FROM fonderie_subscription_trials
@@ -161,103 +263,180 @@ export function trialCheckoutGate(deps: TrialRiskDeps) {
 			);
 			if (consumed.length > 0) return next(); // billing won't grant a trial anyway
 
-			purgeExpiredSignals(deps.store); // opportunistic retention
+			// The explicit paid-without-trial opt-in (the 409 below points here):
+			// consume the trial up-front — billing's schema strips unknown body
+			// fields, and its createSession sees the consumed trial and builds a
+			// plain paid checkout. Nothing to risk-score: no trial is granted.
+			if (body.skipTrial === true) {
+				await deps.store.query(
+					`INSERT INTO fonderie_subscription_trials (subscriber_type, subscriber_id)
+					 VALUES ('user', $1) ON CONFLICT (subscriber_type, subscriber_id) DO NOTHING`,
+					[user.id],
+				);
+				return next();
+			}
 
 			const ip = clientIp(req);
 			const device = deviceFingerprintFrom(headers(req));
-			const ipHash = ip ? hashSignal('ip', ip) : null;
+			const ipHash = ip ? hashIp(ip) : null;
 			const deviceHash = device ? hashSignal('device', device) : null;
 			const domain = emailDomain(user.email);
+			const domainHash = domain ? hashSignal('domain', domain) : null;
 			const cardHash = await cardFingerprintHash(deps, user.id);
 
-			const reuse = await gatherReuseSignals(deps.store, {
-				userId: user.id,
-				cardHash,
-				deviceHash,
-				ipHash,
-			});
-			const accountAgeMinutes = (Date.now() - new Date(user.createdAt).getTime()) / 60_000;
-			const { score, tier } = scoreTrial({
-				...reuse,
-				disposableEmail: isDisposableDomain(domain),
-				accountAgeMinutes,
-			});
+			const verdict: { outcome: 'granted' | 'challenged' | 'denied'; score: number } = {
+				outcome: 'granted',
+				score: 0,
+			};
+			await deps.store.transaction(async (tx) => {
+				await lockSignalKeys(tx, [`user:${user.id}`, deviceHash, ipHash, cardHash]);
+				// A stale in-flight row from an abandoned earlier attempt must not
+				// block this (same-user) retry — the locks make this safe.
+				await clearPendingTrialDecision(tx, user.id);
 
-			const record = (decision: 'granted' | 'challenged' | 'denied') =>
-				recordTrialDecision(deps.store, {
+				const reuse = await gatherReuseSignals(tx, {
 					userId: user.id,
 					cardHash,
 					deviceHash,
 					ipHash,
-					emailDomain: domain,
-					score,
-					decision,
-				}).catch((err) => console.error('trial_signals record failed:', err));
-
-			if (tier === 'high') {
-				await record('denied');
-				json(res, 409, {
-					error: 'TRIAL_NOT_AVAILABLE',
-					message:
-						'A free trial is not available for this account. You can subscribe ' +
-						'directly, or contact support if you believe this is a mistake.',
 				});
+				const accountAgeMinutes = (Date.now() - new Date(user.createdAt).getTime()) / 60_000;
+				const { score, tier } = scoreTrial({
+					...reuse,
+					disposableEmail: isDisposableDomain(domain),
+					accountAgeMinutes,
+				});
+				verdict.score = score;
+
+				if (tier === 'high') {
+					verdict.outcome = 'denied';
+				} else if (tier === 'medium') {
+					// Challenge, don't block: a verified email satisfies the step-up
+					// (the card itself is collected by checkout — trials are card-up).
+					const [row] = await tx.query<{ email_verified_at: Date | null }>(
+						'SELECT email_verified_at FROM fonderie_users WHERE id = $1',
+						[user.id],
+					);
+					if (!row?.email_verified_at) verdict.outcome = 'challenged';
+				}
+
+				await recordTrialDecision(tx, {
+					userId: user.id,
+					cardHash,
+					deviceHash,
+					ipHash,
+					emailDomainHash: domainHash,
+					score,
+					// A passing gate is only PROVISIONAL: the webhook promotes it to
+					// 'granted' when the trial really starts; abandoned/rejected
+					// checkouts age out instead of poisoning the velocity signals.
+					decision: verdict.outcome === 'granted' ? 'pending' : verdict.outcome,
+				});
+			});
+
+			if (verdict.outcome === 'denied') {
+				fail(
+					res,
+					409,
+					'TRIAL_NOT_AVAILABLE',
+					'A free trial is not available for this account. You can still ' +
+						'subscribe without a trial (billing starts immediately), or contact ' +
+						'support if you believe this is a mistake.',
+					{ retryWith: { skipTrial: true }, score: verdict.score },
+				);
+				return;
+			}
+			if (verdict.outcome === 'challenged') {
+				fail(
+					res,
+					402,
+					'TRIAL_RISK_CHALLENGE',
+					'Verify your email address to start the free trial.',
+					{ require: ['email-verification'] },
+				);
 				return;
 			}
 
-			if (tier === 'medium') {
-				// Challenge, don't block: a verified email satisfies the step-up
-				// (the card itself is collected by checkout — trials are card-up).
-				const [row] = await deps.store.query<{ email_verified_at: Date | null }>(
-					'SELECT email_verified_at FROM fonderie_users WHERE id = $1',
-					[user.id],
-				);
-				if (!row?.email_verified_at) {
-					await record('challenged');
-					json(res, 402, {
-						error: 'TRIAL_RISK_CHALLENGE',
-						require: ['email-verification'],
-						message: 'Verify your email address to start the free trial.',
-					});
-					return;
+			// If billing rejects this checkout downstream (bad interval, Stripe
+			// error, …) the provisional row must not linger as a phantom trial.
+			(res as unknown as NodeJS.EventEmitter).once('finish', () => {
+				if (res.statusCode >= 400) {
+					void clearPendingTrialDecision(deps.store, user.id).catch((err) =>
+						console.error('trial_signals pending cleanup failed:', err),
+					);
 				}
-			}
-
-			await record('granted');
+			});
 			next();
 		} catch (err) {
 			// Fail-open: an assessment outage must not block a legitimate checkout.
+			// The card signal still gets enforced at stage 3 (webhook time).
 			console.error('trial risk gate failed (failing open):', err);
 			next();
 		}
 	};
 }
 
-// ── the card back-fill (closes the loop) ──────────────────────────
+// ── stage 3: webhook-time promotion + enforcement ─────────────────
 
 /**
  * Subscribe on the shared events bus. When billing reports a subscription
- * that is TRIALING, fetch the card checkout just saved and stamp its
- * fingerprint hash onto the user's granted-trial row — so the NEXT account
- * that presents this card scores cardFingerprintSeen (+60).
+ * that is TRIALING, resolve the card the checkout just collected and:
+ *
+ *  - if that card's fingerprint already carries a trial on ANOTHER account →
+ *    revoke: cancel the subscription immediately (nothing has been charged —
+ *    it is day 0 of a trial) and mark the decision denied. This is the real
+ *    cross-account card defense: at gate time a fresh signup has no Stripe
+ *    customer yet, so only this point can see the card.
+ *  - otherwise promote the provisional 'pending' row to 'granted' and stamp
+ *    the fingerprint hash, so the NEXT account presenting this card scores
+ *    cardFingerprintSeen.
  */
-export function subscribeTrialCardBackfill(bus: EventBus, deps: TrialRiskDeps): void {
+export function subscribeTrialEnforcement(bus: EventBus, deps: TrialRiskDeps): void {
 	bus.on(
-		'fonderie.billing.subscription.created',
+		EVENT_KEYS.subscriptionCreated,
 		async (payload: unknown) => {
 			try {
 				const p = payload as {
 					subscriberType?: string;
 					subscriberId?: string;
 					status?: string;
+					providerSubscriptionId?: string | null;
 				};
 				if (p.subscriberType !== 'user' || !p.subscriberId || p.status !== 'trialing') return;
-				const cardHash = await cardFingerprintHash(deps, p.subscriberId);
-				if (cardHash) await backfillCardFingerprint(deps.store, p.subscriberId, cardHash);
+
+				const cardHash = await subscriptionCardFingerprintHash(deps, p.subscriberId);
+				if (!cardHash) {
+					// Trial is real regardless — promote so velocity signals stay
+					// truthful; without a fingerprint there is nothing to compare.
+					console.warn(
+						`trial risk: no card fingerprint resolvable for trialing user ${p.subscriberId} — promoting without card stamp`,
+					);
+					await promotePendingToGranted(deps.store, p.subscriberId, null);
+					return;
+				}
+
+				const reused = await cardSeenElsewhere(deps.store, cardHash, p.subscriberId);
+				if (reused && p.providerSubscriptionId) {
+					await deps.provider.cancelSubscription({
+						subscriptionId: p.providerSubscriptionId,
+						atPeriodEnd: false,
+					});
+					await markTrialRevoked(deps.store, p.subscriberId, cardHash);
+					console.error(
+						`trial risk: REVOKED trial for user ${p.subscriberId} — card fingerprint already used by another account's trial`,
+					);
+					return;
+				}
+				if (reused) {
+					console.error(
+						`trial risk: card reuse detected for user ${p.subscriberId} but no providerSubscriptionId to cancel — promoting with stamp; investigate`,
+					);
+				}
+				await promotePendingToGranted(deps.store, p.subscriberId, cardHash);
 			} catch (err) {
-				console.error('trial card back-fill failed:', err);
+				console.error('trial enforcement failed:', err);
 			}
 		},
-		'leadeasygen.trial-risk.card-backfill',
+		'leadeasygen.trial-risk.enforcement',
 	);
 }
