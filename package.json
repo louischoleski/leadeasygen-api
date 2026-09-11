@@ -24,6 +24,7 @@
     "@fonderie/courier": "^7.0.1",
     "@fonderie/events": "^5.0.6",
     "@fonderie/media": "^0.2.4",
+    "@fonderie/rate-limit": "^4.0.7",
     "@fonderie/storage": "^0.1.4",
     "@fonderie/store": "^0.3.0",
     "@fonderie/workspaces": "^6.0.3",

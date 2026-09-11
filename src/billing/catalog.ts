@@ -39,6 +39,12 @@ export const PLANS: IBillingPlan[] = [
 		name: 'unlimited',
 		tier: 1,
 		description: 'Unlimited leads, no credit limits',
+		// 14 days free, card up-front (checkout collects it). Billing's own
+		// guard stops the SAME subscriber re-farming the trial; the app's
+		// trial-risk gate on POST /billing/checkout (src/risk/gate.ts) stops
+		// the cross-ACCOUNT version — new signups reusing a card/device that
+		// already got one.
+		trialDays: 14,
 		monthly: { amount: 4900n, priceId: process.env.STRIPE_PRICE_UNLIMITED_MONTHLY ?? '' },
 		yearly: { amount: 46800n, priceId: process.env.STRIPE_PRICE_UNLIMITED_YEARLY ?? '' },
 		policy: { activeJobs: { limit: null } },
