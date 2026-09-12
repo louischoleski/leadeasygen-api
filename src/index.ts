@@ -21,8 +21,9 @@ import { getAppMigrationsPath } from './db/migrations/index.js';
 import { requireAuth } from './auth/requireAuth.js';
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
-import { captureSignupSignals, subscribeTrialEnforcement, trialCheckoutGate } from './risk/gate.js';
-import { purgeExpiredSignals } from './risk/signals.js';
+import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
+import { getMigrationsPath as riskMigrationsPath } from '@fonderie/risk/migrations';
+import { trialCheckoutGate } from './risk/gate.js';
 
 async function main() {
 	const app = express();
@@ -71,6 +72,9 @@ async function main() {
 		await new InternalMigrationRunner(store, authMigrationsPath()).run();
 		await new InternalMigrationRunner(store, eventsMigrationsPath()).run();
 		await new InternalMigrationRunner(store, getAppMigrationsPath()).run();
+			// @fonderie/risk owns risk_events (the hashed-identity store the trial
+			// gate's assessments read/write). Replaces the app's old trial_signals.
+			await new InternalMigrationRunner(store, riskMigrationsPath()).run();
 		// Courier owns message_logs + the seeded transactional templates that
 		// the auth notification types (email-verification, password-reset, …)
 		// are rendered from.
@@ -281,12 +285,16 @@ async function main() {
 		// Routes registered between mount() and listen() run AFTER bridge()
 		// (full fonderie ctx) and BEFORE the fonderie route handler — so these
 		// compose in front of the brick routes and fall through with next().
-		const risk = { store, provider: stripeProvider };
-		// Stage 1 — record each registration attempt's velocity signals
-		// (hashed IP / device, email domain). Auth's own per-IP limiter
-		// already throttles blatant bursts; this feeds the risk score.
-		app.post('/auth/register', captureSignupSignals(risk));
-		// Stage 2 — the real gate, at the moment billing would grant
+		// The generic decision engine (@fonderie/risk). It DECIDES; this app
+		// ENFORCES. Ships the trial.start ruleset; pepper from env (fails closed
+		// in production). Signals/scoring/hashing + the risk_events store that used
+		// to live in src/risk/ now live in the brick.
+		const riskEngine = new RiskEngine(store, {
+			rulesets: DEFAULT_RULESETS,
+			pepper: process.env.RISK_PEPPER,
+		});
+		const risk = { store, provider: stripeProvider, risk: riskEngine };
+		// The real gate, at the moment billing would grant
 		// plan.trialDays. Auth first (an unauthenticated flood must cost 401s,
 		// not rate-limit tokens), then a PER-USER velocity brake (per-IP would
 		// collapse to one shared bucket behind a proxy with TRUST_PROXY unset,
@@ -309,17 +317,17 @@ async function main() {
 			),
 			trialCheckoutGate(risk),
 		);
-		// Stage 3 — when Stripe reports the trialing subscription and its card:
-		// promote the provisional gate row to granted and stamp the card's
-		// fingerprint hash — or, if that card already carried a trial on
-		// another account, cancel the subscription (the enforcement point the
-		// gate itself cannot reach: a fresh signup has no Stripe customer until
-		// checkout completes).
-		subscribeTrialEnforcement(notifyBus, risk);
-		// Retention purge on a timer — NOT on the request path, where an
-		// attacker who never checks out would simply never trigger it.
-		setInterval(() => purgeExpiredSignals(store), 6 * 60 * 60 * 1000).unref();
-		purgeExpiredSignals(store);
+		// Card-reuse REVOCATION (detect a reused card after checkout and cancel
+		// the trialing subscription) is deliberately out of scope here — it's the
+		// hard, money-path piece that belongs in a separately-designed effort. The
+		// gate above catches the high-volume abuse synchronously; the engine
+		// records the card for when that enforcement lands. See
+		// docs/RISK-BRICK-DESIGN.md (fonderie repo).
+		//
+		// Retention purge on a timer — NOT on the request path (an attacker who
+		// never checks out would never trigger it).
+		setInterval(() => void riskEngine.purgeExpired(), 6 * 60 * 60 * 1000).unref();
+		void riskEngine.purgeExpired();
 
 		// GET /auth/me — requireAuth, returns the current user. The credit balance
 		// is NOT here anymore: it lives on the billing wallet, which the client
