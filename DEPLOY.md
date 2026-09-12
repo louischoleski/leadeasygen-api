@@ -90,9 +90,11 @@ Values that are **not** just copied from `.env`:
 npx vercel --prod
 ```
 
-The rewrite in `vercel.json` sends every path to `api/index.ts`, which serves
-the same Express app as local dev with `migrate:false, timers:false`. The
-declared cron pings `POST /internal/cron/purge` daily (Vercel sends
+Vercel detects the Express app and serves `src/index.ts`'s default export —
+the same app local dev runs, with migrations and timers off (it sets `VERCEL`,
+which the entry keys off). No `api/` function directory and no rewrites: the
+backend-framework detection routes everything to the app, which already owns
+its routing. The declared cron pings `POST /internal/cron/purge` daily (Vercel sends
 `Authorization: Bearer $CRON_SECRET`) — that replaces the in-process retention
 timer, which a frozen serverless instance would never fire.
 

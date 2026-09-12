@@ -1,14 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "api/index.ts": {
-      "memory": 1024,
-      "maxDuration": 30
-    }
-  },
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index" }
-  ],
   "crons": [
     { "path": "/internal/cron/purge", "schedule": "0 4 * * *" }
   ]
