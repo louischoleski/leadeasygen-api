@@ -19,7 +19,7 @@
 		"migrate": "tsx src/migrate.ts"
 	},
 	"dependencies": {
-		"@fonderie/adapter-express": "^5.2.1",
+		"@fonderie/adapter-express": "^5.2.2",
 		"@fonderie/auth": "^7.3.2",
 		"@fonderie/billing": "^9.1.2",
 		"@fonderie/core": ">=0.12.0",

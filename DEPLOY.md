@@ -137,17 +137,24 @@ accepted and queue up but never process.
    wallet never credits.
 3. **Smoke test**:
    ```bash
-   curl https://<api>/health                       # {"status":"ok",...}
+   curl https://<api>/health                       # {"status":"ok"}
+   curl -i https://<api>/                          # 302 -> FRONTEND_URL
    curl -X POST https://<api>/internal/cron/purge \
         -H "Authorization: Bearer $CRON_SECRET"    # {"ok":true}
    ```
    Then register a user in the app, confirm the verification email arrives,
-   and check the login shows up with an IP… which brings us to:
+   and check Settings → Login History shows the IP.
 
-## Known gap
+## Known gaps
 
-Login history records **no IP address**. The adapters resolve the client IP
-but `FonderieApp.handle()` builds a fresh context and drops it, so every
-fonderie-owned route loses it. This also blinds per-IP rate limiting and the
-geo/risk IP signals. It is a bug in `@fonderie/core` + the adapters, not a
-configuration mistake here — fix pending.
+None outstanding. Login history now records the client IP (fixed in
+`@fonderie/core` 0.12.0 — `handle()` was building a fresh context and
+dropping what the adapter resolved, which also blinded per-IP rate limiting
+and the geo/risk signals).
+
+Two things this deployment deliberately does NOT disclose: `/health` answers
+a bare `{"status":"ok"}` rather than naming fonderie and listing the
+installed modules, and `/` redirects instead of printing the product name
+and its auth endpoints. The adapter also suppresses `X-Powered-By`. None of
+that fixes a vulnerability — it keeps the app out of the stack-wide scans
+that assemble target lists for the next framework CVE.
