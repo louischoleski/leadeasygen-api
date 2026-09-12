@@ -40,6 +40,14 @@ export interface CreateAppOptions {
 	 * (POST /internal/cron/purge).
 	 */
 	timers?: boolean;
+	/**
+	 * Max Postgres connections THIS instance may hold. pg defaults to 10, which
+	 * is right for one long-lived server but wrong for serverless: every warm
+	 * instance keeps its own pool, so N instances × 10 exhausts the upstream
+	 * pooler's client limit. A Vercel function handles one request at a time,
+	 * so 1 is enough there.
+	 */
+	poolMax?: number;
 }
 
 /**
@@ -48,7 +56,7 @@ export interface CreateAppOptions {
  * `api/index.ts` (Vercel — exports it as a serverless handler).
  */
 export async function createApp(options: CreateAppOptions = {}) {
-	const { migrate = true, timers = true } = options;
+	const { migrate = true, timers = true, poolMax } = options;
 	const app = express();
 
 	// CORS — the browser frontend (a separate origin) needs this to send the
@@ -89,7 +97,9 @@ export async function createApp(options: CreateAppOptions = {}) {
 	let modules: string[] = [];
 
 	if (databaseUrl) {
-		const store = new PGAdapter(databaseUrl);
+		const store = new PGAdapter(
+			poolMax ? { connectionString: databaseUrl, max: poolMax } : databaseUrl,
+		);
 		if (!(await store.testConnection())) {
 			throw new Error('Cannot connect to the database — check DATABASE_URL.');
 		}

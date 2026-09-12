@@ -23,11 +23,27 @@ else deploys to Vercel.
 Create a project, then take **both** connection strings from *Project Settings →
 Database*:
 
-- **Pooler**, port `6543`, transaction mode → the API's `DATABASE_URL`.
-  Serverless opens many short-lived connections; direct ones run out.
-- **Direct**, port `5432` → migrations and the worker. A transaction-mode
-  pooler is unreliable for DDL and does not support the `LISTEN` the worker
-  needs to pick up jobs.
+- **Transaction pooler**, port `6543` → the API's `DATABASE_URL`. Serverless
+  opens many short-lived connections; direct ones run out. Fonderie is
+  compatible with transaction mode: `PGAdapter` issues plain parameterised
+  queries (node-postgres sends them unnamed, which the pooler allows — named
+  prepared statements would not survive), transactions check out one client
+  for their whole span, and every advisory lock in the codebase is the
+  transaction-scoped `pg_advisory_xact_lock`, released at commit. A
+  session-scoped lock would break here; there aren't any.
+- **Direct**, port `5432` → migrations and the worker. DDL wants a stable
+  session, and the worker opens a dedicated client to `LISTEN` for job
+  notifications, which transaction mode does not support. (It would still
+  limp along on the transport's 1s fallback poll, but with connection errors
+  and no instant wake-up.)
+- **Session pooler** → use *instead of Direct* for those two if the machine is
+  IPv4-only. Supabase direct connections are IPv6-only without the IPv4
+  add-on; the session pooler is the IPv4-reachable session-mode equivalent, so
+  `LISTEN` and DDL still work.
+
+Pool sizing is already handled: the serverless entry caps each instance at one
+connection (`PG_POOL_MAX`, default 1), because pg's default of 10 per warm
+instance multiplies across instances and exhausts the pooler.
 
 Apply the schema once (safe to re-run; it is the same sequence the long-lived
 server runs at boot):

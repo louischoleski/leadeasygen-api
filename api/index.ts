@@ -16,7 +16,14 @@ import { createApp } from '../src/index.js';
 let appPromise: ReturnType<typeof createApp> | undefined;
 
 function getApp() {
-	appPromise ??= createApp({ migrate: false, timers: false }).catch((err) => {
+	appPromise ??= createApp({
+		migrate: false,
+		timers: false,
+		// One connection per instance: a function serves one request at a time,
+		// and every warm instance would otherwise hold pg's default pool of 10
+		// against the shared pooler.
+		poolMax: Number(process.env.PG_POOL_MAX ?? 1),
+	}).catch((err) => {
 		// Don't cache a failed boot — the next request should retry rather than
 		// serve a permanently broken instance from a transient DB hiccup.
 		appPromise = undefined;
