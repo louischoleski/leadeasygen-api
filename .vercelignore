@@ -1,0 +1,13 @@
+# Local/container-only files — the serverless deployment builds api/index.ts.
+.env
+.env.*
+!.env.example
+data
+private
+Dockerfile
+.dockerignore
+*.log
+test-results
+tests
+docs
+dist

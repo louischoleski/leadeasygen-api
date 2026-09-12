@@ -5,7 +5,9 @@
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
 		"outDir": "./dist",
-		"rootDir": "./src",
+		// "." not "./src" so the serverless entry in api/ is typechecked too.
+		// Emitting is tsup's job (`npm run build`); tsc only runs with --noEmit.
+		"rootDir": ".",
 		"strict": true,
 		"esModuleInterop": true,
 		"skipLibCheck": true,
@@ -15,6 +17,6 @@
 		"sourceMap": true,
 		"types": ["node"]
 	},
-	"include": ["src"],
+	"include": ["src", "api"],
 	"exclude": ["node_modules", "dist"]
 }

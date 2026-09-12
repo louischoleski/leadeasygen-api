@@ -14,7 +14,7 @@ import { MediaModule, DbBlobProvider } from '@fonderie/media';
 import { getMigrationsPath as mediaMigrationsPath } from '@fonderie/media/migrations';
 import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/migrations';
 import { adapt, mount } from '@fonderie/adapter-express';
-import { byIp, MemoryStore, rateLimit } from '@fonderie/rate-limit';
+import { byIp, rateLimit, StoreAdapterStore } from '@fonderie/rate-limit';
 import express from 'express';
 
 import { getAppMigrationsPath } from './db/migrations/index.js';
@@ -25,7 +25,30 @@ import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
 import { getMigrationsPath as riskMigrationsPath } from '@fonderie/risk/migrations';
 import { trialCheckoutGate } from './risk/gate.js';
 
-async function main() {
+export interface CreateAppOptions {
+	/**
+	 * Run the module migrations during boot. True for a long-lived server
+	 * (local dev, the container on the box); FALSE on serverless, where every
+	 * cold start would re-run them on the request path and concurrent instances
+	 * would race. There, `npm run migrate` owns schema changes instead.
+	 */
+	migrate?: boolean;
+	/**
+	 * Start the in-process background timers (the risk retention purge). A
+	 * serverless instance is frozen between requests, so its timers never fire
+	 * reliably — the deployment drives the purge with a cron ping instead
+	 * (POST /internal/cron/purge).
+	 */
+	timers?: boolean;
+}
+
+/**
+ * Build the Express app with every module wired, WITHOUT listening. Both
+ * entry points share it: `src/server.ts` (local/container — listens) and
+ * `api/index.ts` (Vercel — exports it as a serverless handler).
+ */
+export async function createApp(options: CreateAppOptions = {}) {
+	const { migrate = true, timers = true } = options;
 	const app = express();
 
 	// CORS — the browser frontend (a separate origin) needs this to send the
@@ -74,6 +97,9 @@ async function main() {
 		// Run migrations before boot. Auth owns the `fonderie_users` table; our
 		// own migration only adds the product-specific `credits` column to it.
 		// Both use InternalMigrationRunner because they touch fonderie_* tables.
+		// Skipped on serverless (see CreateAppOptions.migrate) — `npm run migrate`
+		// runs this same sequence once, out of band.
+		if (migrate) {
 		await new InternalMigrationRunner(store, authMigrationsPath()).run();
 		await new InternalMigrationRunner(store, eventsMigrationsPath()).run();
 		await new InternalMigrationRunner(store, getAppMigrationsPath()).run();
@@ -95,6 +121,7 @@ async function main() {
 			// images sit in Postgres, no S3/MinIO at this stage.
 			await new InternalMigrationRunner(store, storageMigrationsPath()).run();
 			await new InternalMigrationRunner(store, mediaMigrationsPath()).run();
+		}
 
 		// Credit-pack purchases and their payment webhook belong to
 		// @fonderie/billing now: POST /billing/wallet/checkout and
@@ -311,7 +338,11 @@ async function main() {
 			...requireAuth(store),
 			adapt(
 				rateLimit({
-					store: new MemoryStore(),
+					// Postgres-backed, NOT in-memory: a serverless instance is
+					// discarded between requests, so a MemoryStore bucket resets
+					// constantly and the brake silently stops braking. The store-backed
+					// bucket is shared by every instance and survives cold starts.
+					store: new StoreAdapterStore(store),
 					// 10 checkout attempts per user per hour — generous for humans,
 					// hostile to scripted farming. Durable cross-account velocity
 					// lives in trial_signals; this is just a per-account brake.
@@ -330,9 +361,33 @@ async function main() {
 		// docs/RISK-BRICK-DESIGN.md (fonderie repo).
 		//
 		// Retention purge on a timer — NOT on the request path (an attacker who
-		// never checks out would never trigger it).
-		setInterval(() => void riskEngine.purgeExpired(), 6 * 60 * 60 * 1000).unref();
-		void riskEngine.purgeExpired();
+		// never checks out would never trigger it). A serverless instance is
+		// frozen between invocations so its timers can't be trusted; there the
+		// deployment pings the cron route below instead (options.timers = false).
+		if (timers) {
+			setInterval(() => void riskEngine.purgeExpired(), 6 * 60 * 60 * 1000).unref();
+			void riskEngine.purgeExpired();
+		}
+
+		// Cron-driven equivalent of the timer above. Guarded by CRON_SECRET so it
+		// is not a public "do work" button; Vercel Cron sends it as a Bearer
+		// token. Returns 503 rather than running unguarded when the secret is
+		// unset, so a misconfigured deploy fails loudly instead of silently
+		// exposing the route.
+		app.post('/internal/cron/purge', async (req, res) => {
+			const secret = process.env.CRON_SECRET;
+			if (!secret) return res.status(503).json({ error: 'CRON_SECRET is not configured' });
+			if (req.headers.authorization !== `Bearer ${secret}`) {
+				return res.status(401).json({ error: 'Unauthorized' });
+			}
+			try {
+				await riskEngine.purgeExpired();
+				return res.json({ ok: true });
+			} catch (err) {
+				console.error('cron purge failed:', err);
+				return res.status(500).json({ error: 'Purge failed' });
+			}
+		});
 
 		// GET /auth/me — requireAuth, returns the current user. The credit balance
 		// is NOT here anymore: it lives on the billing wallet, which the client
@@ -386,11 +441,5 @@ async function main() {
 		});
 	});
 
-	const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-	app.listen(port, () => {
-		console.log(`🚀 Server ready at http://localhost:${port}`);
-		console.log(`📚 Auth routes: http://localhost:${port}/auth`);
-	});
+	return app;
 }
-
-main().catch(console.error);

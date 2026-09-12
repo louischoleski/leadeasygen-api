@@ -1,0 +1,132 @@
+# Deploying LeadEasyGen
+
+Three pieces, three homes. They are separate on purpose — the reason is the
+scraper.
+
+| Piece | Runs on | Why |
+|---|---|---|
+| `app/` (React SPA) | Vercel | static build, nothing to run |
+| `api/` (Express) | Vercel serverless | request/response only, no browser |
+| `worker` (scrape queue) | any long-running host | drives **Playwright/Chromium** |
+| Postgres | Supabase | reachable from serverless |
+
+**The worker cannot run on Vercel.** It launches a real Chromium through
+Playwright and consumes a queue continuously; serverless gives it neither a
+browser binary nor a long-lived process. Run it wherever it can keep running
+(the Docker box is fine) with `DATABASE_URL` pointed at Supabase. Everything
+else deploys to Vercel.
+
+---
+
+## 1. Database (Supabase)
+
+Create a project, then take **both** connection strings from *Project Settings →
+Database*:
+
+- **Pooler**, port `6543`, transaction mode → the API's `DATABASE_URL`.
+  Serverless opens many short-lived connections; direct ones run out.
+- **Direct**, port `5432` → migrations and the worker. A transaction-mode
+  pooler is unreliable for DDL and does not support the `LISTEN` the worker
+  needs to pick up jobs.
+
+Apply the schema once (safe to re-run; it is the same sequence the long-lived
+server runs at boot):
+
+```bash
+cd api
+DATABASE_URL='<DIRECT connection>' npm run migrate
+```
+
+## 2. API → Vercel
+
+```bash
+cd api
+npx vercel login
+npx vercel link            # create/pick the project
+```
+
+Set the environment variables (each prompts for a value):
+
+```bash
+for k in DATABASE_URL JWT_SECRET RISK_PEPPER CRON_SECRET FRONTEND_URL \
+         STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET STRIPE_WALLET_WEBHOOK_SECRET \
+         STRIPE_PRICE_SMALL STRIPE_PRICE_MEDIUM STRIPE_PRICE_LARGE \
+         STRIPE_PRICE_UNLIMITED_MONTHLY STRIPE_PRICE_UNLIMITED_YEARLY \
+         SMTP_HOST SMTP_PORT SMTP_SECURE SMTP_USER SMTP_PASS SMTP_FROM; do
+  npx vercel env add "$k" production
+done
+```
+
+Values that are **not** just copied from `.env`:
+
+- `DATABASE_URL` — the **pooler** string (port 6543).
+- `JWT_SECRET`, `RISK_PEPPER`, `CRON_SECRET` — fresh secrets, ≥32 chars:
+  `openssl rand -hex 32`. Never reuse the dev values. `RISK_PEPPER` is
+  mandatory: the risk engine **fails the boot** in production without a
+  unique, non-placeholder pepper.
+- `FRONTEND_URL` — the app's public URL. It is both the Stripe return URL and
+  the CORS origin, so a wrong value breaks checkout *and* every browser call.
+- `SMTP_*` — required. The boot fails in production without `SMTP_HOST`,
+  because billing notices and the trial email-verification challenge must be
+  deliverable. Ethereal is a test inbox, not a production sender.
+
+```bash
+npx vercel --prod
+```
+
+The rewrite in `vercel.json` sends every path to `api/index.ts`, which serves
+the same Express app as local dev with `migrate:false, timers:false`. The
+declared cron pings `POST /internal/cron/purge` daily (Vercel sends
+`Authorization: Bearer $CRON_SECRET`) — that replaces the in-process retention
+timer, which a frozen serverless instance would never fire.
+
+## 3. App → Vercel
+
+```bash
+cd app
+npx vercel link
+npx vercel env add VITE_API_URL production          # the API deployment's URL
+npx vercel env add VITE_STRIPE_PUBLISHABLE_KEY production   # optional
+npx vercel env add VITE_GOOGLE_MAPS_API_KEY production      # optional
+npx vercel --prod
+```
+
+`vercel.json` rewrites every path to `index.html`; without it a deep link
+(`/billing`, `/login`) 404s, because react-router owns those paths.
+
+## 4. Worker (wherever it can keep running)
+
+```bash
+DATABASE_URL='<DIRECT connection>' npm run worker
+```
+
+It needs `playwright` installed (a devDependency) and its browsers
+(`npx playwright install chromium`). Without the worker running, jobs are
+accepted and queue up but never process.
+
+## 5. After the first deploy
+
+1. **CORS** — `FRONTEND_URL` must be the app's real origin. The API reflects
+   the request origin today, so the practical failure is Stripe redirects, not
+   preflights; still, set it correctly.
+2. **Stripe webhooks** — re-point both endpoints at the deployed API
+   (`/billing/webhook` and `/billing/webhook/payment`) and update
+   `STRIPE_WEBHOOK_SECRET` / `STRIPE_WALLET_WEBHOOK_SECRET` with the new
+   signing secrets. Until this is done, payments succeed at Stripe but the
+   wallet never credits.
+3. **Smoke test**:
+   ```bash
+   curl https://<api>/health                       # {"status":"ok",...}
+   curl -X POST https://<api>/internal/cron/purge \
+        -H "Authorization: Bearer $CRON_SECRET"    # {"ok":true}
+   ```
+   Then register a user in the app, confirm the verification email arrives,
+   and check the login shows up with an IP… which brings us to:
+
+## Known gap
+
+Login history records **no IP address**. The adapters resolve the client IP
+but `FonderieApp.handle()` builds a fresh context and drops it, so every
+fonderie-owned route loses it. This also blinds per-IP rate limiting and the
+geo/risk IP signals. It is a bug in `@fonderie/core` + the adapters, not a
+configuration mistake here — fix pending.

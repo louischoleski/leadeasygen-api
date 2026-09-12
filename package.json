@@ -6,16 +6,17 @@
 	"type": "module",
 	"scripts": {
 		"dev": "concurrently -k -n api,worker -c cyan,magenta \"npm:dev:api\" \"npm:worker:dev\"",
-		"dev:api": "tsx watch src/index.ts",
+		"dev:api": "tsx watch src/server.ts",
 		"worker": "tsx src/worker.ts",
 		"worker:dev": "tsx watch src/worker.ts",
-		"build": "tsup src/index.ts --format esm --dts && node -e \"require('fs').cpSync('src/db/migrations/sql','dist/sql',{recursive:true})\"",
-		"start": "node dist/index.js",
+		"build": "tsup src/server.ts --format esm --dts && node -e \"require('fs').cpSync('src/db/migrations/sql','dist/sql',{recursive:true})\"",
+		"start": "node dist/server.js",
 		"lint": "oxlint",
 		"typecheck": "tsc --noEmit",
 		"test:e2e": "playwright test",
 		"test:e2e:ui": "playwright test --ui",
-		"test": "node --import tsx --test \"src/**/__tests__/*.test.ts\""
+		"test": "node --import tsx --test \"src/**/__tests__/*.test.ts\"",
+		"migrate": "tsx src/migrate.ts"
 	},
 	"dependencies": {
 		"@fonderie/adapter-express": "^5.1.5",
