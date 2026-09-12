@@ -5,7 +5,7 @@
 	"description": "A Fonderie-powered SaaS backend starter.",
 	"type": "module",
 	"scripts": {
-		"dev": "concurrently -k -n api,worker -c cyan,magenta \"npm:dev:api\" \"npm:worker:dev\"",
+		"dev": "npm run migrate && concurrently -k -n api,worker -c cyan,magenta \"npm:dev:api\" \"npm:worker:dev\"",
 		"dev:api": "tsx watch src/index.ts",
 		"worker": "tsx src/worker.ts",
 		"worker:dev": "tsx watch src/worker.ts",

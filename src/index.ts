@@ -1,40 +1,22 @@
-import 'dotenv/config';
-import express from 'express';
-
-import { configureApp } from './app.js';
+import app, { riskEngine } from './app.js';
 
 /**
- * The one entry, for both homes:
+ * Local / Docker entry — a long-running server. Vercel serves `app.ts`
+ * directly (searched before index), so it never runs this file.
  *
- *   • Vercel — detects the Express app and serves the default export below.
- *     Migrations do NOT run on cold start (every instance would re-run them
- *     and race), and the in-process timers are off (an instance is frozen
- *     between requests) — `npm run migrate` and the cron in vercel.json own
- *     those instead. Each instance holds ONE connection, since it serves one
- *     request at a time and every warm instance would otherwise keep pg's
- *     default pool of 10 against the shared pooler.
- *   • Local / Docker — runs a long-running server via listen() below;
- *     migrations and timers run at boot for convenience.
+ * Process-lifetime concerns live here for that reason: the retention purge
+ * needs a timer, which only a long-running process can be trusted with. On
+ * Vercel the same work is driven by the cron ping declared in vercel.json
+ * (POST /internal/cron/purge).
  */
-const app = express();
-
-const onVercel = !!process.env.VERCEL;
-
-await configureApp({
-	app,
-	migrate: !onVercel,
-	timers: !onVercel,
-	...(onVercel ? { poolMax: Number(process.env.PG_POOL_MAX ?? 1) } : {}),
-});
-
-// Vercel entrypoint: default-export the Express app.
-export default app;
-
-// Local / Docker: start a long-running server (skipped on Vercel).
-if (!onVercel) {
-	const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-	app.listen(port, () => {
-		console.log(`🚀 Server ready at http://localhost:${port}`);
-		console.log(`📚 Auth routes: http://localhost:${port}/auth`);
-	});
+const engine = riskEngine;
+if (engine) {
+	setInterval(() => void engine.purgeExpired(), 6 * 60 * 60 * 1000).unref();
+	void engine.purgeExpired();
 }
+
+const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+app.listen(port, () => {
+	console.log(`🚀 Server ready at http://localhost:${port}`);
+	console.log(`📚 Auth routes: http://localhost:${port}/auth`);
+});

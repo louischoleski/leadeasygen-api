@@ -45,8 +45,10 @@ Pool sizing is already handled: the serverless entry caps each instance at one
 connection (`PG_POOL_MAX`, default 1), because pg's default of 10 per warm
 instance multiplies across instances and exhausts the pooler.
 
-Apply the schema once (safe to re-run; it is the same sequence the long-lived
-server runs at boot):
+Apply the schema once (safe to re-run). Migrations never run at boot — on
+serverless every cold start would re-run them and concurrent instances would
+race — so this is the only thing that creates the schema (`npm run dev` calls
+it first for convenience):
 
 ```bash
 cd api
@@ -90,11 +92,12 @@ Values that are **not** just copied from `.env`:
 npx vercel --prod
 ```
 
-Vercel detects the Express app and serves `src/index.ts`'s default export —
-the same app local dev runs, with migrations and timers off (it sets `VERCEL`,
-which the entry keys off). No `api/` function directory and no rewrites: the
-backend-framework detection routes everything to the app, which already owns
-its routing. The declared cron pings `POST /internal/cron/purge` daily (Vercel sends
+Vercel's Node web-server builder searches `app.*` → `index.*` → `server.*` and
+serves the **default export** — so `src/app.ts` is the entrypoint and never
+listens, while `src/index.ts` (which Vercel therefore never runs) owns the
+long-running server and its timers. This is the layout the fonderie examples
+document in `examples/DEPLOYMENT.md`; no functions directory, no rewrites.
+The declared cron pings `POST /internal/cron/purge` daily (Vercel sends
 `Authorization: Bearer $CRON_SECRET`) — that replaces the in-process retention
 timer, which a frozen serverless instance would never fire.
 
