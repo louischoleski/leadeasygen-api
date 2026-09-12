@@ -386,16 +386,22 @@ export async function configureApp(options: ConfigureAppOptions) {
 		);
 	}
 
+	// Liveness probe. Minimal ON PURPOSE — it used to report `fonderie: true`
+	// and the installed module list, which tells a scanner the stack AND that
+	// auth/billing/media are present. That is the inventory an attacker wants;
+	// a probe only needs the 200.
 	app.get('/health', (_req, res) => {
-		res.json({ status: 'ok', fonderie: true, modules });
+		res.json({ status: 'ok' });
 	});
 
+	// The API host is not a page. It used to answer with the product name, a
+	// version and a list of the auth endpoints. A browser that lands here now
+	// goes to the app; anything else sees what any unknown path returns.
+	// Uniform for every caller on purpose: branching on Accept would itself be
+	// a fingerprint, and it makes debugging with curl worse.
 	app.get('/', (_req, res) => {
-		res.json({
-			message: 'LeadEasyGen backend is running',
-			version: '0.1.0',
-			try: ['GET /health', 'POST /auth/register', 'POST /auth/login', 'GET /auth/me'],
-		});
+		if (frontendUrl) return res.redirect(302, frontendUrl);
+		return res.status(404).json({ reason: 'NOT_FOUND', explanation: 'Not found' });
 	});
 
 	return { riskEngine: engine };
