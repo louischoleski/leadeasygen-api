@@ -13,7 +13,8 @@ import type { ResolveRecipient } from '@fonderie/billing';
 import { MediaModule, DbBlobProvider } from '@fonderie/media';
 import { getMigrationsPath as mediaMigrationsPath } from '@fonderie/media/migrations';
 import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/migrations';
-import { adapt, mount } from '@fonderie/adapter-express';
+import { adapt, cors, mount } from '@fonderie/adapter-express';
+import { DEFAULT_CORS_HEADERS } from '@fonderie/core/middlewares';
 import { byIp, rateLimit, StoreAdapterStore } from '@fonderie/rate-limit';
 import express, { type Express } from 'express';
 
@@ -45,36 +46,21 @@ export interface ConfigureAppOptions {
 export async function configureApp(options: ConfigureAppOptions) {
 	const { app, poolMax } = options;
 
-	// CORS — the browser frontend (a separate origin) needs this to send the
-	// Authorization header to the API. Reflect the request origin (dev-friendly)
-	// and short-circuit preflight before bridge/mount (which 404 on OPTIONS).
-	// Registered first so it applies to every route, including the webhook.
-	app.use((req, res, next) => {
-		const origin = req.headers.origin;
-		if (origin) {
-			res.setHeader('Access-Control-Allow-Origin', origin);
-			res.setHeader('Vary', 'Origin');
-			res.setHeader('Access-Control-Allow-Credentials', 'true');
-			res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-			// X-Device-Fingerprint: the optional trial-risk device signal.
-			// X-Request-ID: sent by @fonderie/client >=0.19 on every call (request
-			// correlation); traceparent: sent by >=0.20 (W3C tracing).
-			// X-Workspace-ID: sent when a workspace is selected.
-			// A header missing here makes the preflight reject the whole request.
-			res.setHeader(
-				'Access-Control-Allow-Headers',
-				'Content-Type, Authorization, X-Device-Fingerprint, X-Request-ID, X-Workspace-ID, traceparent',
-			);
-			// Let browser JS read the echoed correlation id (FonderieApiError.requestId).
-			res.setHeader('Access-Control-Expose-Headers', 'X-Request-ID');
-		}
-		if (req.method === 'OPTIONS') {
-			res.statusCode = 204;
-			res.end();
-			return;
-		}
-		next();
-	});
+	// CORS — app-level so it covers EVERY route, including the ones outside the
+	// fonderie pipeline (custom routes, /health, the Stripe webhooks). The
+	// adapter's defaults already allow every header @fonderie/client sends and
+	// stay in lockstep with it, so a client upgrade can no longer break the
+	// preflight the way it did before. X-Device-Fingerprint is this app's own
+	// trial-risk signal, EXTENDING the defaults rather than replacing them. The
+	// client always fetches with credentials, so the origin must be explicit.
+	const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:5173';
+	app.use(
+		cors({
+			credentials: true,
+			origin: frontendUrl,
+			headers: [...DEFAULT_CORS_HEADERS, 'X-Device-Fingerprint'],
+		}),
+	);
 
 	// Fonderie is mounted only when a database is configured. Without
 	// DATABASE_URL we degrade gracefully: the server still boots and serves
@@ -102,7 +88,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// (wallet.creditPacks from the shared catalog, wallet.webhookSecret =
 		// STRIPE_WALLET_WEBHOOK_SECRET) and mounted with the rest of the Fonderie
 		// routes. No hand-rolled Stripe checkout, no raw `stripe` SDK.
-		const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:5173';
+		// (frontendUrl is declared above, for CORS — same value, same meaning.)
 
 		// NOTE: do NOT add express.json() here. Fonderie's Express adapter reads
 		// the raw request stream itself (bridge → expressRequestToWeb → readStream)
