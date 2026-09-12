@@ -39,12 +39,16 @@ async function main() {
 			res.setHeader('Vary', 'Origin');
 			res.setHeader('Access-Control-Allow-Credentials', 'true');
 			res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-			// X-Device-Fingerprint: the optional trial-risk device signal — without
-			// it here the browser's preflight rejects any request carrying it.
+			// X-Device-Fingerprint: the optional trial-risk device signal.
+			// X-Request-ID: sent by @fonderie/client >=0.19 on every call (request
+			// correlation). X-Workspace-ID: sent when a workspace is selected.
+			// A header missing here makes the preflight reject the whole request.
 			res.setHeader(
 				'Access-Control-Allow-Headers',
-				'Content-Type, Authorization, X-Device-Fingerprint',
+				'Content-Type, Authorization, X-Device-Fingerprint, X-Request-ID, X-Workspace-ID',
 			);
+			// Let browser JS read the echoed correlation id (FonderieApiError.requestId).
+			res.setHeader('Access-Control-Expose-Headers', 'X-Request-ID');
 		}
 		if (req.method === 'OPTIONS') {
 			res.statusCode = 204;
