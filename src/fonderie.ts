@@ -14,6 +14,11 @@ import { byIp, rateLimit, StoreAdapterStore } from '@fonderie/rate-limit';
 import type { Express } from 'express';
 
 import { requireAuth } from './auth/requireAuth.js';
+import {
+	purgeExpiredHandoffs,
+	registerGoogleExchangeRoute,
+	registerGoogleRedirectRoutes,
+} from './auth/googleWeb.js';
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
 import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
@@ -331,7 +336,18 @@ export async function configureApp(options: ConfigureAppOptions) {
 
 		// mount() wires body parsing, context (bridge), and the auth routes onto
 		// Express. bridge runs first, so custom routes added below see req._fonderie.
+		// BEFORE mount(): the catch-all would otherwise serve the package's
+		// JSON callback, which renders tokens in the browser. Only registered
+		// when Google is actually configured, so the routes cannot exist in a
+		// state where they would fail.
+		if (googleOAuth) {
+			registerGoogleRedirectRoutes(app, fonderie, store, frontendUrl);
+		}
+
 		mount(app, fonderie);
+
+		// AFTER mount(): this one needs the body bridge() parses.
+		if (googleOAuth) registerGoogleExchangeRoute(app, store);
 
 		// ── Trial-abuse defense (src/risk/) ──────────────────────────────
 		// Routes registered between mount() and listen() run AFTER bridge()
@@ -400,6 +416,9 @@ export async function configureApp(options: ConfigureAppOptions) {
 			}
 			try {
 				await riskEngine.purgeExpired();
+				await purgeExpiredHandoffs(store).catch((err) =>
+					console.error('[auth:google] handoff purge failed:', err),
+				);
 
 				// Drain before reporting, for two reasons: the numbers below then
 				// describe what is genuinely stuck rather than what merely had not
