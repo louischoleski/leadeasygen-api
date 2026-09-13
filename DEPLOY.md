@@ -188,6 +188,28 @@ that it reached an inbox. A provider that accepts and then bounces asynchronousl
 (Resend does this for an unverified sending domain) looks identical to success
 here. Check the provider's dashboard for that.
 
+The same response carries `billing`, which answers the equivalent question for
+money:
+
+```json
+"billing": {
+  "lastWebhookAt": "2026-09-10T19:02:50.000Z",
+  "purchases": { "last24h": 0, "lastAt": null }
+}
+```
+
+A stale `STRIPE_WEBHOOK_SECRET` is the worst kind of outage: Stripe charges the
+card and reports success, this API rejects the signature with a `400` that only
+exists in a log, and the customer is paid-up with nothing credited. Nothing in
+the product looks broken until someone complains.
+
+These are the two things a webhook actually *moves*, so they detect it without
+Stripe API access — `lastWebhookAt` advances only when a subscription webhook is
+accepted, and a purchase row is written only when a payment webhook credits the
+wallet. **After re-pointing an endpoint or rotating a secret, send a test event
+from the Stripe dashboard and confirm `lastWebhookAt` moves.** If it doesn't, the
+signature is being rejected.
+
 ## 5. After the first deploy
 
 1. **CORS** — `FRONTEND_URL` must be the app's real origin. The API reflects

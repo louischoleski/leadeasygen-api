@@ -393,8 +393,42 @@ export async function configureApp(options: ConfigureAppOptions) {
 						dead.map((d) => `${d.type} (${d.consumer}): ${d.lastError ?? 'no error recorded'}`),
 					);
 				}
+
+				// The same question, asked of money.
+				//
+				// A stale STRIPE_WEBHOOK_SECRET is the worst kind of outage: Stripe
+				// charges the card and reports success, our endpoint rejects the
+				// signature with a 400 that only exists in a log, and the customer
+				// is left paid-up with nothing credited. Nothing in the product
+				// looks wrong until someone complains.
+				//
+				// These two timestamps are what a webhook actually MOVES, so they
+				// answer it without Stripe API access: provider_event_at advances
+				// only when a subscription webhook is accepted, and a purchase row
+				// is written only when a payment webhook credits the wallet. After
+				// re-pointing an endpoint or rotating a secret, send a test event
+				// and watch them move.
+				const billing = await Promise.all([
+					store.query<{ last: Date | null }>(
+						`SELECT max(provider_event_at) AS last FROM fonderie_subscriptions`,
+					),
+					store.query<{ count: string; last: Date | null }>(
+						`SELECT count(*)::text AS count, max(created_at) AS last
+						   FROM fonderie_wallet_ledger
+						  WHERE type = 'purchase' AND created_at > now() - interval '24 hours'`,
+					),
+				])
+					.then(([[sub], [buy]]) => ({
+						lastWebhookAt: sub?.last ? new Date(sub.last).toISOString() : null,
+						purchases: {
+							last24h: Number(buy?.count ?? 0),
+							lastAt: buy?.last ? new Date(buy.last).toISOString() : null,
+						},
+					}))
+					.catch((err) => ({ error: err instanceof Error ? err.message : String(err) }));
 				return res.json({
 					ok: true,
+					billing,
 					queue: {
 						dead: dead.length,
 						pending,
