@@ -415,15 +415,25 @@ export async function configureApp(options: ConfigureAppOptions) {
 					// deployed on Vercel reads as an undelivered notification. Same
 					// total, opposite meanings: one is normal, the other is an outage.
 					store
-						.query<{ consumer: string; count: string }>(
-							`SELECT consumer, count(*)::text AS count
-							   FROM fonderie_event_consumers
-							  WHERE status IN ('pending', 'failed')
-							  GROUP BY consumer`,
+						.query<{ consumer: string; count: string; oldestMinutes: string }>(
+							`SELECT c.consumer, count(*)::text AS count,
+							        extract(epoch FROM now() - min(e.created_at)) / 60 AS "oldestMinutes"
+							   FROM fonderie_event_consumers c
+							   JOIN fonderie_events e ON e.id = c.event_id
+							  WHERE c.status IN ('pending', 'failed')
+							  GROUP BY c.consumer`,
 						)
 						.then((rows) => ({
 							total: rows.reduce((n, r) => n + Number(r.count), 0),
-							byConsumer: Object.fromEntries(rows.map((r) => [r.consumer, Number(r.count)])),
+							byConsumer: Object.fromEntries(
+								rows.map((r) => [
+									r.consumer,
+									// Age, not just a count. "1 waiting" is a queued job on a
+									// worker that is briefly down; "1 waiting, 6 hours old" is
+									// a customer who is never getting their leads.
+									{ waiting: Number(r.count), oldestMinutes: Math.round(Number(r.oldestMinutes ?? 0)) },
+								]),
+							),
 						}))
 						.catch((err) => ({ error: err instanceof Error ? err.message : String(err) })),
 					store
