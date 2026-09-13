@@ -8,6 +8,7 @@ import {
 	buildCourierModule,
 	createNotifyBus,
 	drainAfterResponse,
+	explainDrainFailure,
 	installPlatformBackgroundRunner,
 } from './notifications.js';
 import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
@@ -111,9 +112,10 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// Transactional email via @fonderie/courier. Auth publishes a notification
 		// event (verification pin, password-reset pin, …) onto an EventBus; courier
 		// subscribes and renders+sends it over SMTP using the DB-seeded templates.
-		// Both modules must share ONE bus, so we own it here (in-process memory
-		// transport — notifications are fire-and-forget, no durability needed) and
-		// hand the same instance to auth and courier. Without SMTP_HOST we skip
+		// Both modules must share ONE bus, so we own it here and hand the same
+		// instance to auth and courier. The bus is backed by the Postgres outbox,
+		// NOT memory: fire-and-forget was exactly the bug — the send began after
+		// the response and died with the frozen instance. Without SMTP_HOST we skip
 		// courier entirely and degrade gracefully: auth still records pins in the DB.
 		const smtpHost = process.env.SMTP_HOST;
 		// Payments are configured below, billing's dunning/receipt notices ride
@@ -355,8 +357,8 @@ export async function configureApp(options: ConfigureAppOptions) {
 				const transport = notifications;
 				let drainError: string | null = null;
 				await transport.drain({ maxMs: 20_000 }).catch((err) => {
-					drainError = err instanceof Error ? err.message : String(err);
-					console.error('[queue] cron drain failed:', err);
+					drainError = explainDrainFailure(err);
+					console.error('[queue] cron drain failed:', drainError);
 				});
 
 				// Surface the queue's health while we're here. A dead row is durable,

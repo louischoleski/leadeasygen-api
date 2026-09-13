@@ -134,6 +134,23 @@ export async function installPlatformBackgroundRunner(): Promise<boolean> {
 	}
 }
 
+/**
+ * Say what a drain failure probably means, because the most likely cause has a
+ * one-line fix and an error nobody would connect to it.
+ *
+ * Migrations run out of band, so a deploy can go live ahead of them. The API
+ * then publishes happily — that path touches no new column — while every drain
+ * fails on a column that does not exist yet. Nothing is lost (the rows are
+ * durable and deliver as soon as the migration lands), but the symptom reads as
+ * "email is broken", not as "the deploy is ahead of its migrations".
+ */
+export function explainDrainFailure(err: unknown): string {
+	const message = err instanceof Error ? err.message : String(err);
+	return /column .* does not exist/i.test(message)
+		? `${message} — this deploy is ahead of its migrations; run \`npm run migrate\` against this database. Queued mail is safe and delivers once it lands.`
+		: message;
+}
+
 /** At most one drain in flight per instance — concurrent requests share it. */
 let draining: Promise<void> | null = null;
 
@@ -142,7 +159,7 @@ function drainOnce(bus: EventBus, maxMs: number): Promise<void> {
 		draining = bus
 			.drain({ maxMs })
 			.catch((err) => {
-				console.error('[queue] drain failed:', err);
+				console.error('[queue] drain failed:', explainDrainFailure(err));
 			})
 			.finally(() => {
 				draining = null;
