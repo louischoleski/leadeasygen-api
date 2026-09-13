@@ -1,18 +1,14 @@
 import 'dotenv/config';
-import { FonderieApp, defineConfig, isServerlessRuntime } from '@fonderie/core';
+import { FonderieApp, defineConfig, installPlatformBackgroundRunner, isServerlessRuntime } from '@fonderie/core';
 import { PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
-import {
-	buildCourierModule,
-	createNotifyBus,
-	drainAfterResponse,
-	explainDrainFailure,
-	installPlatformBackgroundRunner,
-} from './notifications.js';
+import { buildCourierModule, createNotifyBus } from './notifications.js';
+import { explainDrainFailure } from '@fonderie/events';
+import { messageStats } from '@fonderie/courier';
 import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS } from '@fonderie/billing';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { MediaModule, DbBlobProvider } from '@fonderie/media';
-import { adapt, cors, mount } from '@fonderie/adapter-express';
+import { adapt, cors, drainQueue, mount } from '@fonderie/adapter-express';
 import { DEFAULT_CORS_HEADERS } from '@fonderie/core/middlewares';
 import { byIp, rateLimit, StoreAdapterStore } from '@fonderie/rate-limit';
 import type { Express } from 'express';
@@ -269,7 +265,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 				? process.env.NOTIFY_DRAIN_IN_API === 'true'
 				: isServerlessRuntime();
 			if (drainInApi) {
-				app.use(drainAfterResponse(notifyBus));
+				app.use(drainQueue(notifyBus));
 				console.log('📧 no worker here — the API drains its own notification queue');
 			}
 		} else {
@@ -403,64 +399,18 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// 0 no matter how badly email is failing. Counting processed rows
 				// answers "was the event dispatched", which is not the question.
 				//
-				// fonderie_message_log is where the send outcome actually lands:
-				// status 'sent' or 'failed', with the provider's error.
-				const [dead, pending, delivered] = await Promise.all([
+				// courier's messageStats() is where the send outcome actually lands.
+				//
+				// Each number now comes from the package that OWNS the table. This
+				// block used to hand-write SQL against other packages' schemas —
+				// which is exactly how a wrong column name once shipped and threw
+				// on every real database.
+				const [dead, pending, email] = await Promise.all([
 					transport.deadLetters(10),
-					// Broken down BY CONSUMER, because one number here conflates two
-					// unrelated queues. The scrape queue writes into the same
-					// fonderie_event_consumers table under consumer 'scrape-worker',
-					// and the API drains only its own subscription ('courier') — so a
-					// scrape job waiting for a worker that is deliberately not
-					// deployed on Vercel reads as an undelivered notification. Same
-					// total, opposite meanings: one is normal, the other is an outage.
-					store
-						.query<{ consumer: string; count: string; oldestMinutes: string }>(
-							`SELECT c.consumer, count(*)::text AS count,
-							        extract(epoch FROM now() - min(e.created_at)) / 60 AS "oldestMinutes"
-							   FROM fonderie_event_consumers c
-							   JOIN fonderie_events e ON e.id = c.event_id
-							  WHERE c.status IN ('pending', 'failed')
-							  GROUP BY c.consumer`,
-						)
-						.then((rows) => ({
-							total: rows.reduce((n, r) => n + Number(r.count), 0),
-							byConsumer: Object.fromEntries(
-								rows.map((r) => [
-									r.consumer,
-									// Age, not just a count. "1 waiting" is a queued job on a
-									// worker that is briefly down; "1 waiting, 6 hours old" is
-									// a customer who is never getting their leads.
-									{ waiting: Number(r.count), oldestMinutes: Math.round(Number(r.oldestMinutes ?? 0)) },
-								]),
-							),
-						}))
-						.catch((err) => ({ error: err instanceof Error ? err.message : String(err) })),
-					store
-						.query<{ status: string; count: string; last: Date | null; err: string | null }>(
-							`SELECT status, count(*)::text AS count, max(created_at) AS last,
-							        (array_agg(error ORDER BY created_at DESC) FILTER (WHERE error IS NOT NULL))[1] AS err
-							   FROM fonderie_message_log
-							  WHERE created_at > now() - interval '24 hours'
-							  GROUP BY status`,
-						)
-						.then((rows) => {
-							const of = (s: string) => rows.find((r) => r.status === s);
-							const sent = of('sent');
-							const failed = of('failed');
-							return {
-								sent24h: Number(sent?.count ?? 0),
-								lastSentAt: sent?.last ? new Date(sent.last).toISOString() : null,
-								failed24h: Number(failed?.count ?? 0),
-								// WHEN it last failed decides whether a failure is history
-								// or an outage: the same error from before a fix looks
-								// identical to one happening right now.
-								lastFailedAt: failed?.last ? new Date(failed.last).toISOString() : null,
-								...(failed?.err ? { lastError: failed.err } : {}),
-								pending24h: Number(of('pending')?.count ?? 0),
-							};
-						})
-						.catch((err) => ({ error: err instanceof Error ? err.message : String(err) })),
+					transport.pendingByConsumer(),
+					messageStats(store, { hours: 24 }).catch((err) => ({
+						error: err instanceof Error ? err.message : String(err),
+					})),
 				]);
 				if (dead.length > 0) {
 					console.error(
@@ -483,6 +433,9 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// is written only when a payment webhook credits the wallet. After
 				// re-pointing an endpoint or rotating a secret, send a test event
 				// and watch them move.
+				// NOT yet behind a billing API — @fonderie/billing has no equivalent
+				// of messageStats() today, so this still reaches into its tables and
+				// carries the same coupling risk. Tracked, not forgotten.
 				const billing = await Promise.all([
 					// The count comes along because `lastWebhookAt: null` on its own
 					// means two opposite things — nobody has ever subscribed, or
@@ -511,10 +464,15 @@ export async function configureApp(options: ConfigureAppOptions) {
 				return res.json({
 					ok: true,
 					billing,
-					email: delivered,
+					email,
 					queue: {
 						dead: dead.length,
-						pending,
+						pending: {
+							total: pending.reduce((n, r) => n + r.waiting, 0),
+							byConsumer: Object.fromEntries(
+								pending.map((r) => [r.consumer, { waiting: r.waiting, oldestMinutes: r.oldestMinutes }]),
+							),
+						},
 						...(drainError ? { drainError } : {}),
 					},
 				});
