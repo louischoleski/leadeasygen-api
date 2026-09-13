@@ -168,7 +168,7 @@ Check the queue any time — the cron route returns it, after draining:
   "queue": {
     "dead": 0,
     "pending": 0,
-    "delivered": { "last24h": 1, "lastAt": "2026-09-13T03:36:15.477Z" }
+    "email": { "sent24h": 1, "lastSentAt": "2026-09-13T03:36:15.477Z", "failed24h": 0 }
   }
 }
 ```
@@ -177,16 +177,26 @@ Check the queue any time — the cron route returns it, after draining:
   with its error.
 - `pending` — waiting or failed-but-retryable. Climbing steadily means nothing
   is consuming.
-- `delivered` — what actually went out. Read this one first after a deploy:
-  `dead: 0, pending: 0` is equally what a healthy queue and a queue nobody ever
-  published to look like, so only a rising `last24h` proves mail is flowing.
+- `email` — the **send outcome**, read from courier's own log rather than the
+  queue. Read this one first after a deploy: `dead: 0, pending: 0` is equally
+  what a healthy queue and a queue nobody ever published to look like, so only
+  a rising `sent24h` proves mail is flowing, and `failed24h` with `lastError`
+  is where a rejection actually shows up.
 - `drainError` — present only when the drain itself failed. Most often the
   deploy is ahead of its migrations; the message says so.
 
-One limit worth knowing: `delivered` means **the SMTP server accepted it**, not
-that it reached an inbox. A provider that accepts and then bounces asynchronously
-(Resend does this for an unverified sending domain) looks identical to success
-here. Check the provider's dashboard for that.
+**Why `email` does not come from the queue.** Courier catches a send failure,
+records it, and does not rethrow — so the event handler resolves and the outbox
+marks the row `processed`. An SMTP rejection therefore looks *identical to a
+success* in `fonderie_event_consumers`, and the outbox's retry/dead-letter
+machinery never sees it: `dead` stays 0 no matter how badly email is failing.
+Counting processed queue rows answers "was the event dispatched", which is not
+the question. `fonderie_message_log` is where the outcome lands.
+
+One limit remains: `sent` means **the SMTP server accepted it**, not that it
+reached an inbox. A provider that accepts and then bounces asynchronously
+(Resend does this for an unverified sending domain) looks like success here.
+Check the provider's dashboard for that.
 
 The same response carries `billing`, which answers the equivalent question for
 money:

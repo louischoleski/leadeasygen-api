@@ -401,25 +401,43 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// from one with nothing to do. Logged loudly so it reaches the
 				// platform logs rather than dying in a table nobody queries.
 				//
-				// `delivered` closes the last gap in this report. dead:0/pending:0 is
-				// what a perfectly healthy queue looks like AND what a queue nobody
-				// ever published to looks like — so on its own it cannot answer the
-				// only question that matters after a deploy: did anything actually
-				// get sent? A timestamp of the last successful delivery can.
+				// `delivered` reads COURIER'S log, not the outbox — they disagree,
+				// and only one of them is about email.
+				//
+				// Courier catches a send failure, records it, and does NOT rethrow
+				// (dispatcher.ts), so the event handler resolves and the outbox
+				// marks the row `processed`. An SMTP rejection therefore looks
+				// exactly like a success in fonderie_event_consumers, and the
+				// outbox's retry/dead-letter machinery never sees it — `dead` stays
+				// 0 no matter how badly email is failing. Counting processed rows
+				// answers "was the event dispatched", which is not the question.
+				//
+				// fonderie_message_log is where the send outcome actually lands:
+				// status 'sent' or 'failed', with the provider's error.
 				const [dead, pending, delivered] = await Promise.all([
 					transport.deadLetters(10),
 					transport.pendingCount(),
 					store
-						.query<{ count: string; last: Date | null }>(
-							`SELECT count(*)::text AS count, max(processed_at) AS last
-							   FROM fonderie_event_consumers
-							  WHERE status = 'processed' AND processed_at > now() - interval '24 hours'`,
+						.query<{ status: string; count: string; last: Date | null; err: string | null }>(
+							`SELECT status, count(*)::text AS count, max(created_at) AS last,
+							        (array_agg(error ORDER BY created_at DESC) FILTER (WHERE error IS NOT NULL))[1] AS err
+							   FROM fonderie_message_log
+							  WHERE created_at > now() - interval '24 hours'
+							  GROUP BY status`,
 						)
-						.then(([row]) => ({
-							last24h: Number(row?.count ?? 0),
-							lastAt: row?.last ? new Date(row.last).toISOString() : null,
-						}))
-						.catch(() => ({ last24h: 0, lastAt: null })),
+						.then((rows) => {
+							const of = (s: string) => rows.find((r) => r.status === s);
+							const sent = of('sent');
+							const failed = of('failed');
+							return {
+								sent24h: Number(sent?.count ?? 0),
+								lastSentAt: sent?.last ? new Date(sent.last).toISOString() : null,
+								failed24h: Number(failed?.count ?? 0),
+								...(failed?.err ? { lastError: failed.err } : {}),
+								pending24h: Number(of('pending')?.count ?? 0),
+							};
+						})
+						.catch((err) => ({ error: err instanceof Error ? err.message : String(err) })),
 				]);
 				if (dead.length > 0) {
 					console.error(
@@ -470,10 +488,10 @@ export async function configureApp(options: ConfigureAppOptions) {
 				return res.json({
 					ok: true,
 					billing,
+					email: delivered,
 					queue: {
 						dead: dead.length,
 						pending,
-						delivered,
 						...(drainError ? { drainError } : {}),
 					},
 				});
