@@ -1,13 +1,17 @@
 import 'dotenv/config';
-import { FonderieApp, defineConfig } from '@fonderie/core';
+import { FonderieApp, defineConfig, isServerlessRuntime } from '@fonderie/core';
 import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
 import { getMigrationsPath as authMigrationsPath } from '@fonderie/auth/migrations';
 import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migrations';
-import { EventsModule, MemoryTransport } from '@fonderie/events';
-import { CourierModule } from '@fonderie/courier';
+import {
+	buildCourierModule,
+	createNotifyBus,
+	drainAfterResponse,
+	installPlatformBackgroundRunner,
+} from './notifications.js';
 import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
-import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS, MESSAGE_KEYS as BILLING_MESSAGE_KEYS, DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES } from '@fonderie/billing';
+import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS } from '@fonderie/billing';
 import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { MediaModule, DbBlobProvider } from '@fonderie/media';
@@ -45,6 +49,10 @@ export interface ConfigureAppOptions {
  */
 export async function configureApp(options: ConfigureAppOptions) {
 	const { app, poolMax } = options;
+
+	// Lets background work outlive the response on platforms that offer it
+	// (Vercel's waitUntil). Off such a platform this is a no-op.
+	await installPlatformBackgroundRunner();
 
 	// CORS — app-level so it covers EVERY route, including the ones outside the
 	// fonderie pipeline (custom routes, /health, the Stripe webhooks). The
@@ -119,7 +127,17 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'trial email-verification challenge need a deliverable email path.',
 			);
 		}
-		const eventsModule = new EventsModule({ transport: new MemoryTransport() });
+		// DURABLE, and producer-only. The API writes notification rows inside the
+		// request but runs no consumer: a poll loop can't run where the process
+		// must return, and LISTEN is rejected by the transaction-mode pooler
+		// production connects through. Delivery is a separate step — the worker,
+		// or a bounded drain from this process (both below). Before this the
+		// transport was in-memory, so a send begun after the response was
+		// abandoned when the instance froze — the user was told to check an email
+		// that never left.
+		const { module: eventsModule, transport: notifications } = createNotifyBus(databaseUrl, {
+			consume: false,
+		});
 		// The bus goes to auth + billing UNCONDITIONALLY (not only with SMTP):
 		// they publish domain events — fonderie.user.registered,
 		// fonderie.billing.subscription.* — that the trial-risk defense below
@@ -202,57 +220,39 @@ export async function configureApp(options: ConfigureAppOptions) {
 			),
 		);
 
-		// Guard on smtpHost so its type narrows to string below. The bus itself
-		// always exists now — only the email consumer (courier) is SMTP-gated.
+		// The bus itself always exists — only the email consumer (courier) is
+		// SMTP-gated.
 		if (smtpHost) {
-			// Every auth message type routed to the email channel. Courier skips any
-			// whose recipient has no email address (e.g. phone-only OTP).
-			const emailOnly = ['email'] as const;
-			fonderieApp = fonderieApp.register(eventsModule).register(
-				new CourierModule(
-					{
-						channels: {
-							'email-verification': [...emailOnly],
-							'email-registration': [...emailOnly],
-							'password-reset': [...emailOnly],
-							'email-changed': [...emailOnly],
-							'phone-changed': [...emailOnly],
-							'mfa-enabled': [...emailOnly],
-							'mfa-disabled': [...emailOnly],
-							'mfa-backup-codes-regenerated': [...emailOnly],
-							// Billing money-flow notices (subscription + wallet). Bodies
-							// come from billing's DEFAULT_TEMPLATES (wired below) rendered
-							// in the DB-seeded layout; no per-key template to author here.
-							[BILLING_MESSAGE_KEYS.subscriptionCanceled]: [...emailOnly],
-							[BILLING_MESSAGE_KEYS.paymentFailed]: [...emailOnly],
-							[BILLING_MESSAGE_KEYS.trialEnding]: [...emailOnly],
-							[BILLING_MESSAGE_KEYS.renewalReceipt]: [...emailOnly],
-							[BILLING_MESSAGE_KEYS.creditsLow]: [...emailOnly],
-							[BILLING_MESSAGE_KEYS.paymentReceipt]: [...emailOnly],
-							[BILLING_MESSAGE_KEYS.refundProcessed]: [...emailOnly],
-							[BILLING_MESSAGE_KEYS.autoRechargeFailed]: [...emailOnly],
-						},
-						email: {
-							provider: 'smtp',
-							from: process.env.SMTP_FROM ?? process.env.SMTP_USER!,
-							smtp: {
-								host: smtpHost,
-								port: Number(process.env.SMTP_PORT ?? 587),
-								secure: process.env.SMTP_SECURE === 'true',
-								user: process.env.SMTP_USER!,
-								pass: process.env.SMTP_PASS!,
-							},
-						},
-						// DB-seeded auth templates (present) win; billing's notices have
-						// no DB seed, so they fall back to billing's shipped defaults.
-						templates: { source: 'db', defaults: [BILLING_DEFAULT_TEMPLATES] },
-					},
-					store,
-					notifyBus,
-				),
-			);
+			// Courier must be registered HERE, on the publisher, even though this
+			// process may never send: consumer rows are written at publish time
+			// from the publisher's own subscriptions, so without it every
+			// notification is stored owing nobody. See notifications.ts.
+			fonderieApp = fonderieApp
+				.register(eventsModule)
+				.register(buildCourierModule(store, notifyBus));
+
+			// Who actually delivers depends on the deployment, and the app has to
+			// say which it is. Locally `npm run dev` starts the worker, which
+			// LISTENs and sends within milliseconds. On Vercel there is no worker
+			// and nothing else would ever read the outbox — so the API consumes
+			// what it produced, after its own response. Set NOTIFY_DRAIN_IN_API to
+			// force either behaviour (a serverless deploy that DOES run a worker,
+			// or a long-running one that does not).
+			const drainInApi = process.env.NOTIFY_DRAIN_IN_API
+				? process.env.NOTIFY_DRAIN_IN_API === 'true'
+				: isServerlessRuntime();
+			if (drainInApi) {
+				app.use(drainAfterResponse(notifyBus));
+				console.log('📧 no worker here — the API drains its own notification queue');
+			}
 		} else {
-			console.warn('⚠️  SMTP_HOST not set — transactional email disabled (pins recorded in DB only).');
+			// Worth being blunt: this is not "email is off for now". Consumer rows
+			// are written by the PUBLISHER at publish time, so with courier absent
+			// here every notification is stored owing nobody — configuring SMTP on
+			// the worker later will not deliver a single one of them.
+			console.warn(
+				'⚠️  SMTP_HOST not set — transactional email disabled. Events published now get NO consumer row and can never be delivered, even after SMTP is configured later.',
+			);
 		}
 
 		// Avatar / image uploads via @fonderie/media. DbBlobProvider stores the
@@ -339,7 +339,33 @@ export async function configureApp(options: ConfigureAppOptions) {
 			}
 			try {
 				await riskEngine.purgeExpired();
-				return res.json({ ok: true });
+
+				// Drain before reporting, for two reasons: the numbers below then
+				// describe what is genuinely stuck rather than what merely had not
+				// been picked up yet, and this is the backstop for anything the
+				// per-response drain missed — a row whose instance died mid-send,
+				// or one published while no traffic followed to trigger a drain.
+				const transport = notifications;
+				await transport.drain({ maxMs: 20_000 }).catch((err) => {
+					console.error('[queue] cron drain failed:', err);
+				});
+
+				// Surface the queue's health while we're here. A dead row is durable,
+				// was retried, and will never be delivered — but until something
+				// LOOKS, a queue that has stopped delivering is indistinguishable
+				// from one with nothing to do. Logged loudly so it reaches the
+				// platform logs rather than dying in a table nobody queries.
+				const [dead, pending] = await Promise.all([
+					transport.deadLetters(10),
+					transport.pendingCount(),
+				]);
+				if (dead.length > 0) {
+					console.error(
+						`[queue] ${dead.length} dead notification(s) — these will NEVER be delivered:`,
+						dead.map((d) => `${d.type} (${d.consumer}): ${d.lastError ?? 'no error recorded'}`),
+					);
+				}
+				return res.json({ ok: true, queue: { dead: dead.length, pending } });
 			} catch (err) {
 				console.error('cron purge failed:', err);
 				return res.status(500).json({ error: 'Purge failed' });

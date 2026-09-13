@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import { PGAdapter } from '@fonderie/store';
+import { FonderieApp, defineConfig } from '@fonderie/core';
+import { buildCourierModule, createNotifyBus, emailConfigured } from './notifications.js';
 import {
 	debitWallet,
 	getSubscription,
@@ -55,6 +57,26 @@ async function main() {
 
 	const store = new PGAdapter(databaseUrl);
 	const bus = createScrapeBus(databaseUrl);
+
+	// ── Notification consumer ────────────────────────────────────────
+	// The API publishes notification rows durably but never consumes them: a
+	// serverless instance is frozen the moment it responds, so a send started
+	// there is abandoned. This process outlives its work, so it owns delivery —
+	// it LISTENs for new rows and sends, and a failure is RETRIED rather than
+	// lost, which is the part awaiting inside the request could never give us.
+	//
+	// Needs the DIRECT connection: LISTEN is not supported through a
+	// transaction-mode pooler.
+	if (emailConfigured()) {
+		const { module: notifications } = createNotifyBus(databaseUrl, { consume: true });
+		await new FonderieApp(defineConfig({ db: { url: databaseUrl } }))
+			.register(notifications)
+			.register(buildCourierModule(store, notifications.bus))
+			.boot();
+		console.log('📧 notification consumer started — delivering queued email');
+	} else {
+		console.warn('⚠️  SMTP_HOST not set — queued notifications will not be delivered.');
+	}
 
 	bus.on<ScrapeTaskJob>(
 		SCRAPE_TASK_EVENT,

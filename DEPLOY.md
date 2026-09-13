@@ -122,8 +122,53 @@ DATABASE_URL='<DIRECT connection>' npm run worker
 ```
 
 It needs `playwright` installed (a devDependency) and its browsers
-(`npx playwright install chromium`). Without the worker running, jobs are
-accepted and queue up but never process.
+(`npx playwright install chromium`). Without the worker running, **scrape jobs**
+are accepted and queue up but never process.
+
+Notification email is a separate matter — see below. It does not need this
+worker, and does not silently stop if the worker is down.
+
+### How a notification actually gets sent
+
+Sending happens in two steps, and the split is what makes it survive
+serverless. When auth or billing triggers an email, nothing is sent inside the
+request: a durable row goes into the `fonderie_events` outbox. Delivery is a
+second, separate step — so an instance frozen the moment it responds costs a
+few seconds of delay, not the email.
+
+Who performs that second step depends on where you run:
+
+| Deployment | Consumer | Latency |
+|---|---|---|
+| `npm run dev` / any long-running host | the worker — `LISTEN`s for new rows | milliseconds |
+| Vercel (no worker) | the API drains its own queue after each response | seconds |
+| Either, as a backstop | the daily cron at `/internal/cron/purge` | up to a day |
+
+The API auto-detects which case it is in; `NOTIFY_DRAIN_IN_API` forces it
+either way (see `.env.example`). On Vercel the drain runs under the platform's
+`waitUntil`, so it does not delay the response.
+
+Two consequences worth knowing:
+
+- **The API must have `SMTP_HOST` set even though the worker is what sends.**
+  Consumer rows are written by the *publisher*, from its own subscriptions — an
+  API with no courier registered writes events that are owed to nobody, and
+  configuring SMTP later will not deliver them. The API logs a loud warning if
+  it boots this way.
+- **A drain being interrupted is harmless.** The row stays claimed only for
+  `claimTimeoutMs` (5 min), after which any consumer may take it — so work
+  abandoned by a killed instance comes back on its own, and two consumers
+  racing for the same row still produce exactly one send.
+
+Check the queue any time — the cron route returns it, after draining:
+
+```json
+{ "ok": true, "queue": { "dead": 0, "pending": 0 } }
+```
+
+`dead` is the number that exhausted their retries and will never be delivered;
+each one is logged with its error. `pending` climbing steadily means nothing is
+consuming.
 
 ## 5. After the first deploy
 
