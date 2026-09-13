@@ -174,6 +174,44 @@ export async function configureApp(options: ConfigureAppOptions) {
 						redirectUri: process.env.GOOGLE_REDIRECT_URI,
 					}
 				: null;
+		// A redirect URI that is merely PRESENT is not enough — Google compares
+		// it LITERALLY, so a wrong one fails at the END of the flow, on Google's
+		// error page, after the user has already committed. Cheap to catch here.
+		//
+		// Note `new URL()` is not the check: "https://https://host/path" parses
+		// happily, with hostname "https" and the real host buried in the path.
+		// And endsWith('/auth/google/callback') accepts "/v1/auth/google/callback"
+		// too. Both of those were my first attempt, and both let the broken value
+		// through — the path must match EXACTLY, and the scheme must appear once.
+		if (googleOAuth) {
+			const raw = googleOAuth.redirectUri;
+			const problems: string[] = [];
+			if (raw.split('://').length > 2) {
+				problems.push('contains "://" more than once — the scheme is duplicated');
+			}
+			let parsed: URL | null = null;
+			try {
+				parsed = new URL(raw);
+			} catch {
+				problems.push('is not a valid URL');
+			}
+			if (parsed) {
+				if (parsed.protocol !== 'https:' && parsed.hostname !== 'localhost') {
+					problems.push(`uses ${parsed.protocol}// — Google requires https outside localhost`);
+				}
+				if (parsed.pathname !== '/auth/google/callback') {
+					problems.push(
+						`has path "${parsed.pathname}" but this API serves auth at the ROOT, so it must be exactly /auth/google/callback (no /v1 here)`,
+					);
+				}
+			}
+			if (problems.length > 0) {
+				console.warn(
+					`⚠️  GOOGLE_REDIRECT_URI will be rejected by Google: it ${problems.join('; and it ')}. ` +
+						`Value seen: ${raw}`,
+				);
+			}
+		}
 		if (!googleOAuth && (process.env.GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_SECRET)) {
 			console.warn(
 				'⚠️  Google sign-in is PARTIALLY configured and therefore disabled — ' +
