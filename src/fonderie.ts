@@ -345,8 +345,17 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// been picked up yet, and this is the backstop for anything the
 				// per-response drain missed — a row whose instance died mid-send,
 				// or one published while no traffic followed to trigger a drain.
+				//
+				// Whether it SUCCEEDED is reported below. A drain must never fail the
+				// cron, but swallowing it silently would recreate the exact blindness
+				// this route exists to remove: a queue that cannot be consumed at all
+				// — an unapplied migration, a revoked credential — looks identical to
+				// an idle one, since `pending` stays 0 only because nothing was ever
+				// claimed. The response says which.
 				const transport = notifications;
+				let drainError: string | null = null;
 				await transport.drain({ maxMs: 20_000 }).catch((err) => {
+					drainError = err instanceof Error ? err.message : String(err);
 					console.error('[queue] cron drain failed:', err);
 				});
 
@@ -365,7 +374,10 @@ export async function configureApp(options: ConfigureAppOptions) {
 						dead.map((d) => `${d.type} (${d.consumer}): ${d.lastError ?? 'no error recorded'}`),
 					);
 				}
-				return res.json({ ok: true, queue: { dead: dead.length, pending } });
+				return res.json({
+					ok: true,
+					queue: { dead: dead.length, pending, ...(drainError ? { drainError } : {}) },
+				});
 			} catch (err) {
 				console.error('cron purge failed:', err);
 				return res.status(500).json({ error: 'Purge failed' });
