@@ -5,7 +5,7 @@ import { AuthModule } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
 import { explainDrainFailure } from '@fonderie/events';
 import { messageStats } from '@fonderie/courier';
-import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS } from '@fonderie/billing';
+import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS, webhookStats } from '@fonderie/billing';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { MediaModule, DbBlobProvider } from '@fonderie/media';
 import { adapt, cors, drainQueue, mount } from '@fonderie/adapter-express';
@@ -433,34 +433,12 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// is written only when a payment webhook credits the wallet. After
 				// re-pointing an endpoint or rotating a secret, send a test event
 				// and watch them move.
-				// NOT yet behind a billing API — @fonderie/billing has no equivalent
-				// of messageStats() today, so this still reaches into its tables and
-				// carries the same coupling risk. Tracked, not forgotten.
-				const billing = await Promise.all([
-					// The count comes along because `lastWebhookAt: null` on its own
-					// means two opposite things — nobody has ever subscribed, or
-					// subscriptions exist and no webhook has ever been accepted for
-					// them. Only the second is an outage, and the number is what
-					// tells them apart.
-					store.query<{ total: string; last: Date | null }>(
-						`SELECT count(*)::text AS total, max(provider_event_at) AS last
-						   FROM fonderie_subscriptions`,
-					),
-					store.query<{ count: string; last: Date | null }>(
-						`SELECT count(*)::text AS count, max(created_at) AS last
-						   FROM fonderie_wallet_ledger
-						  WHERE type = 'purchase' AND created_at > now() - interval '24 hours'`,
-					),
-				])
-					.then(([[sub], [buy]]) => ({
-						subscriptions: Number(sub?.total ?? 0),
-						lastWebhookAt: sub?.last ? new Date(sub.last).toISOString() : null,
-						purchases: {
-							last24h: Number(buy?.count ?? 0),
-							lastAt: buy?.last ? new Date(buy.last).toISOString() : null,
-						},
-					}))
-					.catch((err) => ({ error: err instanceof Error ? err.message : String(err) }));
+				// Billing owns these tables, so billing answers the question. This
+				// block used to hand-write SQL against fonderie_subscriptions and
+				// fonderie_wallet_ledger.
+				const billing = await webhookStats(store, { hours: 24 }).catch((err) => ({
+					error: err instanceof Error ? err.message : String(err),
+				}));
 				return res.json({
 					ok: true,
 					billing,
