@@ -433,6 +433,10 @@ export async function configureApp(options: ConfigureAppOptions) {
 								sent24h: Number(sent?.count ?? 0),
 								lastSentAt: sent?.last ? new Date(sent.last).toISOString() : null,
 								failed24h: Number(failed?.count ?? 0),
+								// WHEN it last failed decides whether a failure is history
+								// or an outage: the same error from before a fix looks
+								// identical to one happening right now.
+								lastFailedAt: failed?.last ? new Date(failed.last).toISOString() : null,
 								...(failed?.err ? { lastError: failed.err } : {}),
 								pending24h: Number(of('pending')?.count ?? 0),
 							};
