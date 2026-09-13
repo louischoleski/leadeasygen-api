@@ -77,6 +77,9 @@ export async function configureApp(options: ConfigureAppOptions) {
 	let engine: RiskEngine | null = null;
 	const databaseUrl = process.env.DATABASE_URL;
 	let modules: string[] = [];
+	// What the login screen may offer. Declared out here because /config is
+	// served whether or not a database is configured.
+	let authProviders: string[] = ['email'];
 
 	if (databaseUrl) {
 		const store = new PGAdapter(
@@ -162,6 +165,36 @@ export async function configureApp(options: ConfigureAppOptions) {
 				: null;
 		};
 
+		// Google sign-in, configured only when all three values are present.
+		//
+		// Env-gated on purpose, rather than a boolean flag: a half-configured
+		// OAuth provider is worse than an absent one — the button appears, the
+		// user commits to a redirect, and the failure lands on Google's error
+		// page where the app cannot explain it. Requiring all three means the
+		// route only exists when it can actually complete, and /auth/providers
+		// (below) tells the frontend which buttons to render, so the UI can
+		// never offer one that would dead-end.
+		//
+		// GOOGLE_REDIRECT_URI must match the Authorized redirect URI in the
+		// Google Cloud console EXACTLY — scheme, host, path, no trailing slash.
+		const googleOAuth =
+			process.env.GOOGLE_CLIENT_ID &&
+			process.env.GOOGLE_CLIENT_SECRET &&
+			process.env.GOOGLE_REDIRECT_URI
+				? {
+						clientId: process.env.GOOGLE_CLIENT_ID,
+						clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+						redirectUri: process.env.GOOGLE_REDIRECT_URI,
+					}
+				: null;
+		if (!googleOAuth && (process.env.GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_SECRET)) {
+			console.warn(
+				'⚠️  Google sign-in is PARTIALLY configured and therefore disabled — ' +
+					'GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI are all required.',
+			);
+		}
+		if (googleOAuth) authProviders = ['email', 'google'];
+
 		// Standard Fonderie auth mold: stateless JWT sessions, email provider.
 		// (Clerk is not a Fonderie brick; @fonderie/auth is the default.)
 		// Registers POST /auth/register, POST /auth/login, POST /auth/refresh,
@@ -172,7 +205,8 @@ export async function configureApp(options: ConfigureAppOptions) {
 				{
 					jwtSecret: process.env.JWT_SECRET ?? 'dev-secret-change-me-min-32-chars-long',
 					appName: 'LeadEasyGen',
-					providers: ['email'],
+					providers: googleOAuth ? ['email', 'google'] : ['email'],
+					...(googleOAuth ? { google: googleOAuth } : {}),
 					requireVerification: false,
 				},
 				notifyBus,
@@ -495,6 +529,18 @@ export async function configureApp(options: ConfigureAppOptions) {
 	// a probe only needs the 200.
 	app.get('/health', (_req, res) => {
 		res.json({ status: 'ok' });
+	});
+
+	// What the frontend is allowed to offer, decided by the server.
+	//
+	// The alternative is a build-time VITE_ flag, which is the same fact stored
+	// twice: the app would claim Google is available while the API had it
+	// disabled, and the mismatch surfaces as a user hitting a dead redirect.
+	// Asking the side that actually holds the credentials makes that
+	// unrepresentable. Deliberately says nothing about the stack — no module
+	// list, no versions, just the buttons to draw.
+	app.get('/config', (_req, res) => {
+		res.json({ auth: { providers: authProviders } });
 	});
 
 	// The API host is not a page. It used to answer with the product name, a
