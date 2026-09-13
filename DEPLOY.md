@@ -239,6 +239,34 @@ opposite things on its own:
    Then register a user in the app, confirm the verification email arrives,
    and check Settings → Login History shows the IP.
 
+### Verifying the client IP behind the proxy
+
+`TRUST_PROXY` is read by `@fonderie/core`'s `resolveClientIp`, not by this app —
+nothing in `src/` references it, and that is expected. Set it in the environment
+and it takes effect.
+
+`TRUST_PROXY=1` means "one trusted proxy hop", so the client is the **last**
+entry in `X-Forwarded-For` — the one Vercel appends itself. That is both correct
+and spoof-safe there: a client-supplied value stays to the left and is never
+chosen. It matches Express's numeric `trust proxy` convention.
+
+Getting it wrong is quiet, not loud — every request resolves to the proxy's
+address, so per-IP rate limiting collapses into one global bucket (one attacker
+locks out everyone) and the geo/risk signals see a single fictional user. So
+verify it rather than assuming:
+
+```bash
+# log in, then read the history back
+curl -X POST https://<api>/auth/login -H 'Content-Type: application/json' \
+     -d '{"email":"...","password":"..."}'
+curl https://<api>/auth/login-history -H "Authorization: Bearer <access-token>"
+```
+
+The `ip` on the newest event must be a **public, routable** address. A private
+one (`10.*`, `172.16–31.*`, `192.168.*`, `127.*`) or `null` means the setting is
+not taking effect. Verified on this deployment 2026-09-13: a real client IP is
+recorded.
+
 ## Known gaps
 
 None outstanding. Login history now records the client IP (fixed in
