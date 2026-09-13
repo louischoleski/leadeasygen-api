@@ -69,9 +69,6 @@ export async function configureApp(options: ConfigureAppOptions) {
 	// /health and /, so you can `npm run dev` immediately after scaffolding.
 	let engine: RiskEngine | null = null;
 	const databaseUrl = process.env.DATABASE_URL;
-	// What the login screen may offer. Declared out here because /config is
-	// served whether or not a database is configured.
-	let authProviders: string[] = ['email'];
 
 	if (databaseUrl) {
 		const store = new PGAdapter(
@@ -223,7 +220,6 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI are all required.',
 			);
 		}
-		if (googleOAuth) authProviders = ['email', 'google'];
 
 		// Standard Fonderie auth mold: stateless JWT sessions, email provider.
 		// (Clerk is not a Fonderie brick; @fonderie/auth is the default.)
@@ -563,17 +559,6 @@ export async function configureApp(options: ConfigureAppOptions) {
 		res.json({ status: 'ok' });
 	});
 
-	// What the frontend is allowed to offer, decided by the server.
-	//
-	// The alternative is a build-time VITE_ flag, which is the same fact stored
-	// twice: the app would claim Google is available while the API had it
-	// disabled, and the mismatch surfaces as a user hitting a dead redirect.
-	// Asking the side that actually holds the credentials makes that
-	// unrepresentable. Deliberately says nothing about the stack — no module
-	// list, no versions, just the buttons to draw.
-	app.get('/config', (_req, res) => {
-		res.json({ auth: { providers: authProviders } });
-	});
 
 	// The API host is not a page. It used to answer with the product name, a
 	// version and a list of the auth endpoints. A browser that lands here now

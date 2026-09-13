@@ -20,7 +20,7 @@
 	},
 	"dependencies": {
 		"@fonderie/adapter-express": "^5.3.0",
-		"@fonderie/auth": "^7.3.5",
+		"@fonderie/auth": "^7.4.0",
 		"@fonderie/billing": "^9.2.0",
 		"@fonderie/core": ">=0.15.0",
 		"@fonderie/courier": "^7.1.0",
