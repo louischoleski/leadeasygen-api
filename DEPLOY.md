@@ -193,6 +193,7 @@ money:
 
 ```json
 "billing": {
+  "subscriptions": 2,
   "lastWebhookAt": "2026-09-10T19:02:50.000Z",
   "purchases": { "last24h": 0, "lastAt": null }
 }
@@ -209,6 +210,14 @@ accepted, and a purchase row is written only when a payment webhook credits the
 wallet. **After re-pointing an endpoint or rotating a secret, send a test event
 from the Stripe dashboard and confirm `lastWebhookAt` moves.** If it doesn't, the
 signature is being rejected.
+
+Read `subscriptions` alongside it, because `lastWebhookAt: null` means two
+opposite things on its own:
+
+- `subscriptions: 0` — nobody has ever subscribed. Nothing is wrong; there is
+  simply nothing for a webhook to have updated.
+- `subscriptions: N` with `lastWebhookAt: null` — subscriptions exist and no
+  webhook has ever been accepted for them. That is the outage.
 
 ## 5. After the first deploy
 

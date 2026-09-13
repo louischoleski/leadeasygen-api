@@ -409,8 +409,14 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// re-pointing an endpoint or rotating a secret, send a test event
 				// and watch them move.
 				const billing = await Promise.all([
-					store.query<{ last: Date | null }>(
-						`SELECT max(provider_event_at) AS last FROM fonderie_subscriptions`,
+					// The count comes along because `lastWebhookAt: null` on its own
+					// means two opposite things — nobody has ever subscribed, or
+					// subscriptions exist and no webhook has ever been accepted for
+					// them. Only the second is an outage, and the number is what
+					// tells them apart.
+					store.query<{ total: string; last: Date | null }>(
+						`SELECT count(*)::text AS total, max(provider_event_at) AS last
+						   FROM fonderie_subscriptions`,
 					),
 					store.query<{ count: string; last: Date | null }>(
 						`SELECT count(*)::text AS count, max(created_at) AS last
@@ -419,6 +425,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					),
 				])
 					.then(([[sub], [buy]]) => ({
+						subscriptions: Number(sub?.total ?? 0),
 						lastWebhookAt: sub?.last ? new Date(sub.last).toISOString() : null,
 						purchases: {
 							last24h: Number(buy?.count ?? 0),
