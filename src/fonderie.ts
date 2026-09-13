@@ -1,9 +1,7 @@
 import 'dotenv/config';
 import { FonderieApp, defineConfig, isServerlessRuntime } from '@fonderie/core';
-import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
+import { PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
-import { getMigrationsPath as authMigrationsPath } from '@fonderie/auth/migrations';
-import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migrations';
 import {
 	buildCourierModule,
 	createNotifyBus,
@@ -11,24 +9,18 @@ import {
 	explainDrainFailure,
 	installPlatformBackgroundRunner,
 } from './notifications.js';
-import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
 import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS } from '@fonderie/billing';
-import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { MediaModule, DbBlobProvider } from '@fonderie/media';
-import { getMigrationsPath as mediaMigrationsPath } from '@fonderie/media/migrations';
-import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/migrations';
 import { adapt, cors, mount } from '@fonderie/adapter-express';
 import { DEFAULT_CORS_HEADERS } from '@fonderie/core/middlewares';
 import { byIp, rateLimit, StoreAdapterStore } from '@fonderie/rate-limit';
-import express, { type Express } from 'express';
+import type { Express } from 'express';
 
-import { getAppMigrationsPath } from './db/migrations/index.js';
 import { requireAuth } from './auth/requireAuth.js';
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
 import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
-import { getMigrationsPath as riskMigrationsPath } from '@fonderie/risk/migrations';
 import { trialCheckoutGate } from './risk/gate.js';
 
 export interface ConfigureAppOptions {
@@ -76,7 +68,6 @@ export async function configureApp(options: ConfigureAppOptions) {
 	// /health and /, so you can `npm run dev` immediately after scaffolding.
 	let engine: RiskEngine | null = null;
 	const databaseUrl = process.env.DATABASE_URL;
-	let modules: string[] = [];
 	// What the login screen may offer. Declared out here because /config is
 	// served whether or not a database is configured.
 	let authProviders: string[] = ['email'];
@@ -536,8 +527,6 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// (via @fonderie/client / @fonderie/react-billing). The old
 		// /v1/credits/balance compatibility shim was removed in the phase-E client
 		// cutover; nothing under /v1/credits remains.
-
-		modules = ['auth', 'tasks', 'billing', 'media'];
 	} else {
 		console.warn(
 			'⚠️  DATABASE_URL is not set — Fonderie modules are disabled. ' +
