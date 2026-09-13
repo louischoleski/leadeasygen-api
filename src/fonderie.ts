@@ -407,7 +407,25 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// status 'sent' or 'failed', with the provider's error.
 				const [dead, pending, delivered] = await Promise.all([
 					transport.deadLetters(10),
-					transport.pendingCount(),
+					// Broken down BY CONSUMER, because one number here conflates two
+					// unrelated queues. The scrape queue writes into the same
+					// fonderie_event_consumers table under consumer 'scrape-worker',
+					// and the API drains only its own subscription ('courier') — so a
+					// scrape job waiting for a worker that is deliberately not
+					// deployed on Vercel reads as an undelivered notification. Same
+					// total, opposite meanings: one is normal, the other is an outage.
+					store
+						.query<{ consumer: string; count: string }>(
+							`SELECT consumer, count(*)::text AS count
+							   FROM fonderie_event_consumers
+							  WHERE status IN ('pending', 'failed')
+							  GROUP BY consumer`,
+						)
+						.then((rows) => ({
+							total: rows.reduce((n, r) => n + Number(r.count), 0),
+							byConsumer: Object.fromEntries(rows.map((r) => [r.consumer, Number(r.count)])),
+						}))
+						.catch((err) => ({ error: err instanceof Error ? err.message : String(err) })),
 					store
 						.query<{ status: string; count: string; last: Date | null; err: string | null }>(
 							`SELECT status, count(*)::text AS count, max(created_at) AS last,
