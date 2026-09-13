@@ -366,9 +366,26 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// LOOKS, a queue that has stopped delivering is indistinguishable
 				// from one with nothing to do. Logged loudly so it reaches the
 				// platform logs rather than dying in a table nobody queries.
-				const [dead, pending] = await Promise.all([
+				//
+				// `delivered` closes the last gap in this report. dead:0/pending:0 is
+				// what a perfectly healthy queue looks like AND what a queue nobody
+				// ever published to looks like — so on its own it cannot answer the
+				// only question that matters after a deploy: did anything actually
+				// get sent? A timestamp of the last successful delivery can.
+				const [dead, pending, delivered] = await Promise.all([
 					transport.deadLetters(10),
 					transport.pendingCount(),
+					store
+						.query<{ count: string; last: Date | null }>(
+							`SELECT count(*)::text AS count, max(processed_at) AS last
+							   FROM fonderie_event_consumers
+							  WHERE status = 'processed' AND processed_at > now() - interval '24 hours'`,
+						)
+						.then(([row]) => ({
+							last24h: Number(row?.count ?? 0),
+							lastAt: row?.last ? new Date(row.last).toISOString() : null,
+						}))
+						.catch(() => ({ last24h: 0, lastAt: null })),
 				]);
 				if (dead.length > 0) {
 					console.error(
@@ -378,7 +395,12 @@ export async function configureApp(options: ConfigureAppOptions) {
 				}
 				return res.json({
 					ok: true,
-					queue: { dead: dead.length, pending, ...(drainError ? { drainError } : {}) },
+					queue: {
+						dead: dead.length,
+						pending,
+						delivered,
+						...(drainError ? { drainError } : {}),
+					},
 				});
 			} catch (err) {
 				console.error('cron purge failed:', err);
