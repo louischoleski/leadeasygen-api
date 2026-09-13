@@ -163,12 +163,30 @@ Two consequences worth knowing:
 Check the queue any time — the cron route returns it, after draining:
 
 ```json
-{ "ok": true, "queue": { "dead": 0, "pending": 0 } }
+{
+  "ok": true,
+  "queue": {
+    "dead": 0,
+    "pending": 0,
+    "delivered": { "last24h": 1, "lastAt": "2026-09-13T03:36:15.477Z" }
+  }
+}
 ```
 
-`dead` is the number that exhausted their retries and will never be delivered;
-each one is logged with its error. `pending` climbing steadily means nothing is
-consuming.
+- `dead` — exhausted their retries and will never be delivered; each is logged
+  with its error.
+- `pending` — waiting or failed-but-retryable. Climbing steadily means nothing
+  is consuming.
+- `delivered` — what actually went out. Read this one first after a deploy:
+  `dead: 0, pending: 0` is equally what a healthy queue and a queue nobody ever
+  published to look like, so only a rising `last24h` proves mail is flowing.
+- `drainError` — present only when the drain itself failed. Most often the
+  deploy is ahead of its migrations; the message says so.
+
+One limit worth knowing: `delivered` means **the SMTP server accepted it**, not
+that it reached an inbox. A provider that accepts and then bounces asynchronously
+(Resend does this for an unverified sending domain) looks identical to success
+here. Check the provider's dashboard for that.
 
 ## 5. After the first deploy
 
