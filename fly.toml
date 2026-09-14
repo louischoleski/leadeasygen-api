@@ -1,0 +1,55 @@
+# Scrape worker on Fly.
+#
+# The worker is the one part of this app serverless cannot host: a scrape runs
+# for minutes, pins a CPU, and holds a stateful Chromium process. It is a queue
+# CONSUMER, not a server — it listens for work and connects out to Postgres.
+#
+# It therefore serves no HTTP, which has a consequence worth stating plainly:
+# Fly can only wake a stopped machine from an incoming request, so this app
+# cannot scale to zero. It runs continuously on the smallest useful VM. The
+# alternative — give it an HTTP endpoint and have the API poke it on publish —
+# trades a permanently-running machine for a queue that drains only when
+# something remembers to knock, which is the failure this outbox exists to
+# remove. Not taken.
+#
+#   fly launch --no-deploy --copy-config    # first time, creates the app
+#   fly secrets set ...                     # see below — REQUIRED
+#   fly deploy
+
+app = "leadeasygen-worker"
+primary_region = "yul"   # Montreal — near the app's users and its database
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  # CHROME_EXECUTABLE_PATH is deliberately absent. Unset means the bundled
+  # Chromium the Playwright base image ships; it is only set on a dev machine
+  # where Playwright cannot install its own build.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # Chromium is memory-hungry. At 256MB the renderer is killed mid-scrape,
+  # which surfaces as a task stuck in 'scraping' rather than a clean error.
+  memory = "1gb"
+
+# ── Secrets — set before the first deploy ────────────────────────────────────
+#
+#   fly secrets set DATABASE_URL='...'
+#
+# DATABASE_URL MUST BE A SESSION-MODE CONNECTION STRING, and it is NOT the same
+# value the API uses. The API points at Supabase's TRANSACTION pooler (6543),
+# which is correct there — a serverless function must not hold a connection.
+# But a transaction-mode pooler REJECTS `LISTEN`, and this worker's whole job
+# is to LISTEN for work. Give it the 6543 URL and the process dies on startup,
+# at the first `LISTEN fonderie_events`.
+#
+# Use the direct/session connection instead (Supabase: port 5432, or the
+# "Session pooler" string). See src/notifications.ts, which documents the same
+# split from the publishing side.
+#
+# Optional — this process also drains the notification queue. Without these it
+# logs a warning and delivers no email:
+#   fly secrets set SMTP_HOST='...' SMTP_PORT='465' SMTP_SECURE='true' \
+#                   SMTP_USER='...' SMTP_PASS='...' SMTP_FROM='...'
