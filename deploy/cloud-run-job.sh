@@ -39,11 +39,18 @@ IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${JOB}"
 # not trigger the job, deliberately: doing so needs a credential crossing from
 # Vercel into GCP, and it buys seconds on a job that already takes tens of them.
 #
-# Every 2 minutes runs ~21,600 times a month. At 2 vCPU and a ~6s empty run
-# that is ~259k vCPU-seconds against a free tier of ~180k, so roughly $0.50/mo.
-# Deliberate: the latency is worth more than the change. Move to */5 to sit
-# inside the free tier entirely.
-SCHEDULE="${SCHEDULE:-*/2 * * * *}"
+# Every minute runs ~43,200 times a month. At 2 vCPU and a ~6s empty run that
+# is ~518k vCPU-seconds against a free tier of ~180k — roughly $2.40/mo.
+# Deliberate: pickup latency is worth more than the change. */5 is the only
+# interval fully inside the free tier.
+#
+# Overlapping executions are EXPECTED at this interval: a scrape takes minutes,
+# so a new job starts while the last is still working. That is safe because
+# claiming is exclusive (FOR UPDATE ... SKIP LOCKED plus a visibility lease) —
+# the second execution cannot take a row the first holds, finds nothing, and
+# exits in seconds. If a scrape ever WEDGES, executions stack until
+# --task-timeout expires; lower that timeout rather than the schedule.
+SCHEDULE="${SCHEDULE:-*/1 * * * *}"
 
 if [[ -z "$PROJECT" ]]; then
 	echo "No project set. Run: gcloud config set project <your-project-id>" >&2
