@@ -81,6 +81,17 @@ if ! gcloud secrets describe leadeasygen-database-url --project "$PROJECT" >/dev
 		--data-file=- --project "$PROJECT" --quiet
 fi
 
+# The job RUNS as this service account too, and reading the mounted secret is a
+# separate permission from building the image. Granted on the SECRET rather than
+# the project: this account should be able to read this one credential, not
+# every secret the project will ever hold.
+echo "→ secret access for the runtime service account"
+RUNTIME_SA="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
+gcloud secrets add-iam-policy-binding leadeasygen-database-url \
+	--member "serviceAccount:${RUNTIME_SA}" \
+	--role roles/secretmanager.secretAccessor \
+	--project "$PROJECT" --quiet >/dev/null
+
 # Projects created since mid-2024 do not get the legacy Cloud Build service
 # account, and builds run as the Compute Engine default SA instead — which does
 # not carry the build and push roles by default. Granting them is idempotent.
