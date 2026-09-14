@@ -1,6 +1,6 @@
 import { EventsModule, PGTransport } from '@fonderie/events';
 import { CourierModule } from '@fonderie/courier';
-import { MESSAGE_KEYS as AUTH_MESSAGE_KEYS } from '@fonderie/auth';
+import { MESSAGE_KEYS as AUTH_MESSAGE_KEYS, DEFAULT_TEMPLATES as AUTH_DEFAULT_TEMPLATES } from '@fonderie/auth';
 import {
 	MESSAGE_KEYS as BILLING_MESSAGE_KEYS,
 	DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES,
@@ -75,12 +75,15 @@ export function buildCourierModule(store: IStoreAdapter, bus: EventBus): Courier
 				//
 				// phoneOtp is the one exclusion: it is SMS-only and this app sends no
 				// SMS, so routing it to email would put a one-time code in the wrong
-				// channel.
+				// channel. Mapped to an EMPTY list rather than omitted, which is how
+				// courier's boot guard tells a deliberate opt-out from drift — an
+				// absent key is reported, an empty one is understood.
 				...Object.fromEntries(
 					Object.values(AUTH_MESSAGE_KEYS)
 						.filter((key) => key !== AUTH_MESSAGE_KEYS.phoneOtp)
 						.map((key) => [key, [...emailOnly]]),
 				),
+				[AUTH_MESSAGE_KEYS.phoneOtp]: [],
 				// Billing money-flow notices (subscription + wallet). Bodies come from
 				// billing's DEFAULT_TEMPLATES rendered in the DB-seeded layout.
 				...Object.fromEntries(
@@ -100,9 +103,14 @@ export function buildCourierModule(store: IStoreAdapter, bus: EventBus): Courier
 					pass: process.env.SMTP_PASS!,
 				},
 			},
-			// DB-seeded auth templates win; billing's notices have no DB seed and
-			// fall back to billing's shipped defaults.
-			templates: { source: 'db', defaults: [BILLING_DEFAULT_TEMPLATES] },
+			// DB-seeded templates win; anything without a DB seed falls back to the
+			// package's shipped default.
+			//
+			// BOTH packages' defaults are passed, not just billing's. Beyond the
+			// fallback, this is what courier's boot guard compares the channel map
+			// against — so shipping auth's defaults is what makes a missing auth
+			// route visible at boot rather than at the first user who triggers it.
+			templates: { source: 'db', defaults: [AUTH_DEFAULT_TEMPLATES, BILLING_DEFAULT_TEMPLATES] },
 		},
 		store,
 		bus,
