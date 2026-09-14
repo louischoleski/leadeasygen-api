@@ -1,5 +1,6 @@
 import { EventsModule, PGTransport } from '@fonderie/events';
 import { CourierModule } from '@fonderie/courier';
+import { MESSAGE_KEYS as AUTH_MESSAGE_KEYS } from '@fonderie/auth';
 import {
 	MESSAGE_KEYS as BILLING_MESSAGE_KEYS,
 	DEFAULT_TEMPLATES as BILLING_DEFAULT_TEMPLATES,
@@ -64,24 +65,27 @@ export function buildCourierModule(store: IStoreAdapter, bus: EventBus): Courier
 	return new CourierModule(
 		{
 			channels: {
-				'email-verification': [...emailOnly],
-				'email-registration': [...emailOnly],
-				'password-reset': [...emailOnly],
-				'email-changed': [...emailOnly],
-				'phone-changed': [...emailOnly],
-				'mfa-enabled': [...emailOnly],
-				'mfa-disabled': [...emailOnly],
-				'mfa-backup-codes-regenerated': [...emailOnly],
+				// DERIVED from each package's own key list, never hand-written. A
+				// hand-written map silently drops anything added upstream: courier
+				// logs 'no channels configured' and returns, so the notice is
+				// published, never delivered, never retried — and nobody reads that
+				// log line. Every auth notice added today was already missing this
+				// way (oauth-linked, oauth-unlinked, oauth-registration), including
+				// the password-revoked security notice.
+				//
+				// phoneOtp is the one exclusion: it is SMS-only and this app sends no
+				// SMS, so routing it to email would put a one-time code in the wrong
+				// channel.
+				...Object.fromEntries(
+					Object.values(AUTH_MESSAGE_KEYS)
+						.filter((key) => key !== AUTH_MESSAGE_KEYS.phoneOtp)
+						.map((key) => [key, [...emailOnly]]),
+				),
 				// Billing money-flow notices (subscription + wallet). Bodies come from
 				// billing's DEFAULT_TEMPLATES rendered in the DB-seeded layout.
-				[BILLING_MESSAGE_KEYS.subscriptionCanceled]: [...emailOnly],
-				[BILLING_MESSAGE_KEYS.paymentFailed]: [...emailOnly],
-				[BILLING_MESSAGE_KEYS.trialEnding]: [...emailOnly],
-				[BILLING_MESSAGE_KEYS.renewalReceipt]: [...emailOnly],
-				[BILLING_MESSAGE_KEYS.creditsLow]: [...emailOnly],
-				[BILLING_MESSAGE_KEYS.paymentReceipt]: [...emailOnly],
-				[BILLING_MESSAGE_KEYS.refundProcessed]: [...emailOnly],
-				[BILLING_MESSAGE_KEYS.autoRechargeFailed]: [...emailOnly],
+				...Object.fromEntries(
+					Object.values(BILLING_MESSAGE_KEYS).map((key) => [key, [...emailOnly]]),
+				),
 			},
 			email: {
 				provider: 'smtp',
