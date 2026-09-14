@@ -35,10 +35,15 @@ REGION="${REGION:-northamerica-northeast1}"
 REPO="${REPO:-leadeasygen}"
 JOB="${JOB:-scrape-worker}"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${JOB}"
-# How often to look for queued work. Not latency-critical: a scrape takes tens
-# of seconds, so minutes of pickup delay is invisible next to that — and a
-# tighter schedule burns free-tier seconds on runs that find nothing.
-SCHEDULE="${SCHEDULE:-*/5 * * * *}"
+# How often to look for queued work. This IS the pickup latency — the API does
+# not trigger the job, deliberately: doing so needs a credential crossing from
+# Vercel into GCP, and it buys seconds on a job that already takes tens of them.
+#
+# Every 2 minutes runs ~21,600 times a month. At 2 vCPU and a ~6s empty run
+# that is ~259k vCPU-seconds against a free tier of ~180k, so roughly $0.50/mo.
+# Deliberate: the latency is worth more than the change. Move to */5 to sit
+# inside the free tier entirely.
+SCHEDULE="${SCHEDULE:-*/2 * * * *}"
 
 if [[ -z "$PROJECT" ]]; then
 	echo "No project set. Run: gcloud config set project <your-project-id>" >&2
