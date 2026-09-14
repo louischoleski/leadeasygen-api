@@ -96,10 +96,21 @@ async function main() {
 					return;
 				}
 
-				await store.query(
-					"UPDATE scrape_tasks SET status = 'scraping', updated_at = now() WHERE id = $1",
+				// Take the job by moving it out of 'pending' — conditionally. The
+				// user may have cancelled between the event being queued and this
+				// worker reaching it, and a plain UPDATE would happily scrape (and
+				// later charge for) a task they explicitly stopped. Guarding on
+				// status = 'pending' also makes redelivery safe: a second worker
+				// handed the same event updates zero rows and drops out.
+				const claimed = await store.query<{ id: string }>(
+					`UPDATE scrape_tasks SET status = 'scraping', updated_at = now()
+					  WHERE id = $1 AND status = 'pending' RETURNING id`,
 					[taskId],
 				);
+				if (!claimed[0]) {
+					console.log(`Task ${taskId} is no longer pending (cancelled or already claimed) — skipping.`);
+					return;
+				}
 
 				const leads = await scrapeGoogleMaps({
 					url: task.url,

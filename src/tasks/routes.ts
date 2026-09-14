@@ -240,7 +240,9 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 					const dup = await tx.query<{ id: string; status: string }>(
 						`SELECT id, status FROM scrape_tasks
 						   WHERE user_id = $1 AND dedup_key = $2 AND superseded_by IS NULL
-						     AND status <> 'error'
+						     -- 'cancelled' is terminal and deliberate: the user asked for
+						     -- this search to stop, so it must not block queuing it again.
+						     AND status NOT IN ('error', 'cancelled')
 						     AND created_at > now() - $3::interval
 						     -- A finished run that found nothing shouldn't block a retry — only
 						     -- in-progress runs and completed runs that actually returned leads
@@ -364,6 +366,67 @@ export function registerTaskRoutes(app: Express, store: IStoreAdapter): void {
 	});
 
 	// GET /v1/tasks — list the authenticated user's tasks (summaries only).
+	/**
+	 * Cancel a queued scrape.
+	 *
+	 * Only a 'pending' task can be cancelled, and the check lives INSIDE the
+	 * UPDATE's WHERE clause rather than in a prior read: the worker claims jobs
+	 * concurrently, so a status read followed by a write can cancel a task that
+	 * started scraping in between. A task the worker already picked up is
+	 * reported as such (409) instead of being pretended-cancelled — there is a
+	 * real browser mid-run and nothing here can stop it.
+	 *
+	 * No refund path is needed. The wallet is debited on COMPLETION, so a task
+	 * that never ran was never charged.
+	 *
+	 * The queue row is deliberately left alone. Deleting it would race the
+	 * worker's claim and destroy the delivery record; instead the worker
+	 * re-reads status after claiming and skips anything cancelled.
+	 */
+	app.post('/v1/tasks/:id/cancel', ...requireAuth(store), async (req: Request, res: Response) => {
+		const { id } = req.params;
+		if (!UUID_RE.test(id)) {
+			return res.status(404).json({ error: 'Not found' });
+		}
+		const userId = req.user!.id;
+
+		try {
+			const cancelled = await store.query<{ id: string }>(
+				`UPDATE scrape_tasks
+				    SET status = 'cancelled', updated_at = now()
+				  WHERE id = $1 AND user_id = $2 AND status = 'pending'
+				  RETURNING id`,
+				[id, userId],
+			);
+			if (cancelled[0]) {
+				return res.json({ status: 'cancelled', taskId: id });
+			}
+
+			// Nothing changed. Distinguish the reasons — "already running" and
+			// "does not exist" need different things from the caller, and a bare
+			// 404 for a task the user can see on screen reads as a bug.
+			const rows = await store.query<{ status: string }>(
+				'SELECT status FROM scrape_tasks WHERE id = $1 AND user_id = $2',
+				[id, userId],
+			);
+			const task = rows[0];
+			if (!task) return res.status(404).json({ error: 'Not found' });
+			if (task.status === 'scraping') {
+				return res.status(409).json({
+					error: 'This scrape has already started and will finish on its own.',
+					status: task.status,
+				});
+			}
+			return res.status(409).json({
+				error: `This scrape is already ${task.status}.`,
+				status: task.status,
+			});
+		} catch (err) {
+			console.error('cancel task failed:', err);
+			return res.status(500).json({ error: 'Could not cancel the task' });
+		}
+	});
+
 	app.get('/v1/tasks', ...requireAuth(store), async (req: Request, res: Response) => {
 		try {
 			// Superseded rows are old failures replaced by a retry — hidden so a
