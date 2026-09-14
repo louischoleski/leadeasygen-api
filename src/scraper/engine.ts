@@ -122,9 +122,22 @@ export async function scrapeGoogleMaps(input: { url: string; limit?: number }): 
 	const { url: googleUrl, limit } = input;
 	const cap = typeof limit === 'number' && limit >= 0 ? limit : Infinity;
 
+	// Which Chrome to drive is a property of the MACHINE, not of the scraper.
+	// This used to hardcode '/Applications/Google Chrome.app/...', a local
+	// workaround for a dev box where Playwright's bundled build would not run.
+	// That path does not exist on Linux, so the worker could never have scraped
+	// anything on any host it might actually be deployed to — launch throws
+	// before the first page load.
+	//
+	// Unset (the normal case, including every Linux host) means Playwright's own
+	// bundled Chromium, which is what `playwright install` provides.
+	const executablePath = process.env.CHROME_EXECUTABLE_PATH;
 	const browser = await chromium.launch({
-		executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+		...(executablePath ? { executablePath } : {}),
 		headless: true,
+		// Chromium's sandbox needs kernel privileges most container runtimes
+		// withhold; without this it fails to start as root in a container.
+		args: ['--no-sandbox', '--disable-dev-shm-usage'],
 	});
 
 	try {
