@@ -81,6 +81,14 @@ jobs:
       # tests — it picks up a just-created job and, with no scrape target in CI,
       # flips it to 'error', which the dedup/active-job queries exclude — so a
       # duplicate resubmit non-deterministically 201-creates instead of 409ing.
+      # `dev:api` starts the server ONLY — unlike `dev`, which is
+      # `migrate && concurrently`. Against a fresh CI database that means the
+      # API boots with no schema and dies on the first query
+      # (`relation "fonderie_plans" does not exist`), so the health check never
+      # passes and every run fails before a single test executes. Migrate first.
+      - name: Run migrations
+        run: npm run migrate
+
       - name: Start API, wait for health, run e2e
         run: |
           npm run dev:api > api.log 2>&1 &
