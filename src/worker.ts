@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { PGAdapter } from '@fonderie/store';
+import type { EventBus } from '@fonderie/events';
 import { FonderieApp, defineConfig } from '@fonderie/core';
 import { buildCourierModule, createNotifyBus, emailConfigured } from './notifications.js';
 import {
@@ -56,7 +57,10 @@ async function main() {
 	}
 
 	const store = new PGAdapter(databaseUrl);
-	const bus = createScrapeBus(databaseUrl);
+	// Poll rather than LISTEN. See createScrapeBus: this is what lets the worker
+	// share the API's DATABASE_URL instead of needing its own session-mode one.
+	const runOnce = process.env.WORKER_ONCE === '1';
+	const bus = createScrapeBus(databaseUrl, { consume: false });
 
 	// ── Notification consumer ────────────────────────────────────────
 	// The API publishes notification rows durably but never consumes them: a
@@ -65,14 +69,16 @@ async function main() {
 	// it LISTENs for new rows and sends, and a failure is RETRIED rather than
 	// lost, which is the part awaiting inside the request could never give us.
 	//
-	// Needs the DIRECT connection: LISTEN is not supported through a
-	// transaction-mode pooler.
+	// Polls rather than LISTENs, so it needs no special connection: the same
+	// DATABASE_URL the API publishes with is enough.
+	let notifyBus: EventBus | null = null;
 	if (emailConfigured()) {
-		const { module: notifications } = createNotifyBus(databaseUrl, { consume: true });
+		const { module: notifications } = createNotifyBus(databaseUrl, { consume: false });
 		await new FonderieApp(defineConfig({ db: { url: databaseUrl } }))
 			.register(notifications)
 			.register(buildCourierModule(store, notifications.bus))
 			.boot();
+		notifyBus = notifications.bus;
 		console.log('📧 notification consumer started — delivering queued email');
 	} else {
 		console.warn('⚠️  SMTP_HOST not set — queued notifications will not be delivered.');
@@ -194,7 +200,44 @@ async function main() {
 	);
 
 	await bus.start();
-	console.log('🛠️  scrape-task worker started — waiting for jobs…');
+
+	const buses = notifyBus ? [bus, notifyBus] : [bus];
+	const pollMs = Number(process.env.WORKER_POLL_MS ?? 5_000);
+	// A scrape is minutes of work, so a pass must be allowed to finish one
+	// rather than being cut short and leaving the row to wait out its lease.
+	const maxMs = Number(process.env.WORKER_MAX_MS ?? 240_000);
+
+	const drainAll = async (): Promise<void> => {
+		for (const b of buses) {
+			// One bad pass must never end the process: a transient database blip
+			// would otherwise stop the queue until a human noticed.
+			await b.drain({ maxMs }).catch((err) => console.error('[worker] drain failed:', err));
+		}
+	};
+
+	if (runOnce) {
+		// Run-once mode, for a job platform that expects the process to END
+		// (Cloud Run Jobs, a Kubernetes CronJob, a scheduled container).
+		await drainAll();
+		for (const b of buses) await b.stop();
+		await store.end();
+		console.log('🛠️  scrape-task worker drained and exited (WORKER_ONCE).');
+		return;
+	}
+
+	console.log(`🛠️  scrape-task worker started — polling every ${pollMs}ms…`);
+	let draining = false;
+	const timer = setInterval(() => {
+		// Never overlap passes: a scrape can outlast the interval, and a second
+		// pass would just contend for rows the first already claimed.
+		if (draining) return;
+		draining = true;
+		void drainAll().finally(() => { draining = false; });
+	}, pollMs);
+	// Drain immediately too — a worker starting with a backlog should not wait
+	// out a full interval before touching it.
+	draining = true;
+	void drainAll().finally(() => { draining = false; });
 
 	let shuttingDown = false;
 	const shutdown = async (signal: string) => {
@@ -214,7 +257,9 @@ async function main() {
 		forceExit.unref();
 
 		try {
-			await bus.stop();
+			clearInterval(timer);
+			for (const b of buses) await b.stop();
+			await store.end();
 		} catch (err) {
 			console.error('Error during shutdown:', err);
 		} finally {

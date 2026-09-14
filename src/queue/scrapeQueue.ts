@@ -24,8 +24,25 @@ export interface ScrapeTaskJob {
  * Create an EventBus bound to Postgres. Both the API and the worker call this
  * (each in its own process) against the same DATABASE_URL.
  */
-export function createScrapeBus(connectionUrl: string): EventBus {
-	return new EventBus(new PGTransport({ connectionUrl }));
+export function createScrapeBus(
+	connectionUrl: string,
+	options: { consume?: boolean } = {},
+): EventBus {
+	// `consume` decides whether this process LISTENs or polls, and that choice
+	// decides which CONNECTION STRING the process can use at all.
+	//
+	// LISTEN holds a session open, which a transaction-mode pooler refuses — so
+	// a listening worker needs a second, session-mode URL that the API does not
+	// use. A polling worker issues no LISTEN and therefore runs on exactly the
+	// same DATABASE_URL as everything else. One credential, one config, one less
+	// thing to get wrong at deploy time.
+	//
+	// The cost is latency: a job waits up to one poll interval instead of
+	// starting instantly. For a scrape measured in tens of seconds that is
+	// noise, and it buys a worker that deploys anywhere without a second secret.
+	return new EventBus(
+		new PGTransport({ connectionUrl, ...(options.consume === undefined ? {} : { consume: options.consume }) }),
+	);
 }
 
 /**
