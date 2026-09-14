@@ -1,7 +1,41 @@
 import { randomBytes } from "node:crypto";
 import type { Express, Request, Response } from "express";
+import { resolveClientIp } from "@fonderie/core/middlewares";
 import type { FonderieApp } from "@fonderie/core";
 import type { IStoreAdapter } from "@fonderie/store/types";
+
+/**
+ * Carry the caller's identity into the synthetic request these routes build.
+ *
+ * `fonderie.handle()` is called directly here rather than through the adapter,
+ * and a Request constructed by hand starts with none of the caller's context.
+ * Auth records the IP and user-agent on every login event, so anything missing
+ * here is missing from the security surface the user reads: an OAuth sign-in
+ * shows "Unknown device" and no IP while password sign-ins show both — which
+ * makes the login history useless precisely where it matters, since a provider
+ * sign-in is the one an attacker is most likely to use.
+ *
+ * The IP is RESOLVED, not copied: behind a proxy the socket address is the
+ * proxy's. resolveClientIp applies the same TRUST_PROXY-aware logic the
+ * adapters use — never re-derive forwarding rules locally.
+ */
+export function callerContext(req: Request): {
+	headers: Record<string, string>;
+	init: { meta: { clientIp: string } } | undefined;
+} {
+	const incoming = new Headers();
+	for (const [key, value] of Object.entries(req.headers)) {
+		if (typeof value === "string") incoming.set(key, value);
+		else if (Array.isArray(value)) incoming.set(key, value.join(", "));
+	}
+	const clientIp = resolveClientIp(req.socket?.remoteAddress ?? undefined, incoming);
+
+	const headers: Record<string, string> = { cookie: req.headers.cookie ?? "" };
+	const ua = req.headers["user-agent"];
+	if (typeof ua === "string" && ua) headers["user-agent"] = ua;
+
+	return { headers, init: clientIp ? { meta: { clientIp } } : undefined };
+}
 
 /**
  * The browser half of Google sign-in.
@@ -36,10 +70,15 @@ export function registerGoogleRedirectRoutes(
   frontendUrl: string,
 ): void {
   // ── start ────────────────────────────────────────────────────────
-  app.get("/auth/google/start", async (_req: Request, res: Response) => {
+  app.get("/auth/google/start", async (req: Request, res: Response) => {
     try {
+      const caller = callerContext(req);
       const inner = await fonderie.handle(
-        new Request("http://internal/auth/google", { method: "GET" }),
+        new Request("http://internal/auth/google", {
+          method: "GET",
+          headers: caller.headers,
+        }),
+        caller.init,
       );
       const body = (await inner.json()) as { result?: { url?: string } };
       const url = body.result?.url;
@@ -74,11 +113,10 @@ export function registerGoogleRedirectRoutes(
       for (const [k, v] of Object.entries(req.query)) {
         if (typeof v === "string") target.searchParams.set(k, v);
       }
+      const caller = callerContext(req);
       const inner = await fonderie.handle(
-        new Request(target, {
-          method: "GET",
-          headers: { cookie: req.headers.cookie ?? "" },
-        }),
+        new Request(target, { method: "GET", headers: caller.headers }),
+        caller.init,
       );
       const body = (await inner.json()) as {
         reason?: string;
