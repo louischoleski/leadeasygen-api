@@ -56,6 +56,11 @@ gcloud services enable \
 	secretmanager.googleapis.com \
 	--project "$PROJECT" --quiet
 
+# Enablement is not instant. A build fired the moment `services enable` returns
+# fails with PERMISSION_DENIED on a project where Cloud Build has never run.
+echo "  waiting for API enablement to propagate"
+sleep 30
+
 echo "→ artifact registry"
 gcloud artifacts repositories describe "$REPO" --location "$REGION" --project "$PROJECT" >/dev/null 2>&1 || \
 	gcloud artifacts repositories create "$REPO" \
@@ -76,8 +81,24 @@ if ! gcloud secrets describe leadeasygen-database-url --project "$PROJECT" >/dev
 		--data-file=- --project "$PROJECT" --quiet
 fi
 
+# Projects created since mid-2024 do not get the legacy Cloud Build service
+# account, and builds run as the Compute Engine default SA instead — which does
+# not carry the build and push roles by default. Granting them is idempotent.
+echo "→ cloud build permissions"
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
+BUILD_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+for ROLE in roles/cloudbuild.builds.builder roles/artifactregistry.writer roles/logging.logWriter; do
+	gcloud projects add-iam-policy-binding "$PROJECT" \
+		--member "serviceAccount:${BUILD_SA}" --role "$ROLE" \
+		--condition=None --quiet >/dev/null
+done
+
+# Built in the GLOBAL Cloud Build, deliberately. Regional Cloud Build needs a
+# worker pool and bucket that a new project has not provisioned, and fails with
+# PERMISSION_DENIED that reads like an account problem. The image still lands in
+# the regional Artifact Registry — only the builder location differs.
 echo "→ build (remote — nothing is built on this machine)"
-gcloud builds submit --tag "$IMAGE" --project "$PROJECT" --region "$REGION" .
+gcloud builds submit --tag "$IMAGE" --project "$PROJECT" .
 
 # WORKER_ONCE=1 is what makes this terminate. Without it the container polls
 # forever, the Job never completes, and Cloud Run kills it at the task timeout —
