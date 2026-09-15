@@ -5,7 +5,13 @@ import { AuthModule } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
 import { explainDrainFailure } from '@fonderie/events';
 import { messageStats } from '@fonderie/courier';
-import { BillingModule, StripeProvider, SUPPORTED_PAYMENT_OPTIONS, webhookStats } from '@fonderie/billing';
+import {
+	BillingModule,
+	StripeProvider,
+	SUPPORTED_PAYMENT_OPTIONS,
+	checkWebhookRegistration,
+	webhookStats,
+} from '@fonderie/billing';
 import type { ResolveRecipient } from '@fonderie/billing';
 import { MediaModule, DbBlobProvider } from '@fonderie/media';
 import { adapt, cors, drainQueue, mount } from '@fonderie/adapter-express';
@@ -492,9 +498,47 @@ export async function configureApp(options: ConfigureAppOptions) {
 				const billing = await webhookStats(store, { hours: 24 }).catch((err) => ({
 					error: err instanceof Error ? err.message : String(err),
 				}));
+
+				// The stats above can only report on events that ARRIVED. They are
+				// blind to the opposite failure: an event we handle that Stripe was
+				// never told to send. That one produces no delivery, no error and no
+				// log line — dunning simply stops happening — and from in here "no
+				// invoice.payment_failed yet" is indistinguishable from "it will never
+				// come". The only way to tell them apart is to ask Stripe what it was
+				// configured to send, which is what this does.
+				//
+				// Requires PUBLIC_API_URL because the comparison is by URL, and it has
+				// to be the exact URL registered in the Stripe dashboard. Deliberately
+				// NOT inferred from VERCEL_URL: that is the per-deployment hostname,
+				// so it would never match the registered endpoint and would report
+				// every event missing on every run. A check that cries wolf is worse
+				// than no check — it trains you to ignore it — so when the URL is
+				// absent we say "not configured" instead of guessing.
+				const publicApiUrl = process.env.PUBLIC_API_URL?.replace(/\/+$/, '');
+				const registration = publicApiUrl
+					? await checkWebhookRegistration(stripeProvider, {
+							subscriptionUrl: `${publicApiUrl}/billing/webhook`,
+							paymentUrl: `${publicApiUrl}/billing/webhook/payment`,
+						}).catch((err) => ({
+							error: err instanceof Error ? err.message : String(err),
+							endpoints: [],
+							ok: false,
+						}))
+					: { skipped: 'PUBLIC_API_URL is not set', endpoints: [], ok: true };
+
+				// Loud in the log as well as in the response: a cron that only ever
+				// gets read when someone goes looking is not an alarm.
+				if (!registration.ok) {
+					console.error(
+						'[billing] webhook registration is incomplete — events we handle will NEVER arrive:',
+						JSON.stringify(registration.endpoints),
+					);
+				}
+
 				return res.json({
 					ok: true,
 					billing,
+					registration,
 					email,
 					queue: {
 						dead: dead.length,
