@@ -39,9 +39,24 @@ back and redeploy."
 
 Four settings and three external systems. Everything else derives from these.
 
+### First, decide the canonical host
+
+Vercel serves the apex and `www` as one canonical host and 308-redirects the
+other. **Whichever it redirects TO is the value every other setting must use.**
+
+Check the app project's Domains list: the row showing `↳ 308 …` is the one that
+redirects. By default Vercel makes **`www` canonical**, so the apex redirects to
+it — in which case `FRONTEND_URL` is `https://www.leadeasygen.com`, not the apex.
+
+Pointing `FRONTEND_URL` at the redirecting host costs an extra hop on every OAuth
+callback and can drop the state cookie across the redirect. Decide now, before
+Step 3, so the variables are set once.
+
+The table below assumes **`www` canonical**. Swap the two if you flip it.
+
 | where | key | today | after |
 |---|---|---|---|
-| API (Vercel) | `FRONTEND_URL` | `https://leadeasygen-app.vercel.app` | `https://leadeasygen.com` |
+| API (Vercel) | `FRONTEND_URL` | `https://leadeasygen-app.vercel.app` | `https://www.leadeasygen.com` |
 | API (Vercel) | `GOOGLE_REDIRECT_URI` | `…-api.vercel.app/auth/google/callback` | `https://api.leadeasygen.com/auth/google/callback` |
 | API (Vercel) | `PUBLIC_API_URL` | *(unset)* | `https://api.leadeasygen.com` |
 | App (Vercel) | `VITE_API_URL` | `https://leadeasygen-api.vercel.app` | `https://api.leadeasygen.com` |
@@ -76,13 +91,36 @@ Vercel shows the DNS records to create. At your registrar:
 
 > Use whatever Vercel actually displays — the apex target occasionally changes.
 
-Wait for Vercel to show **Valid Configuration** on all three. TLS certificates are
-issued automatically. Propagation is usually minutes; allow up to an hour.
+### Step 1b — Domain verification (the `_vercel` TXT record)
+
+**Correct A/CNAME records are not enough.** If Vercel shows **Verification
+Required** while `dig` already returns the right answers, it is not a DNS routing
+problem — Vercel is asking you to prove you own the domain before it will serve
+it or issue a certificate.
+
+Click **View DNS configuration** on the row and it shows a TXT record:
+
+| type | host | value |
+|---|---|---|
+| `TXT` | `_vercel` | `vc-domain-verify=leadeasygen.com,<token>` |
+
+Add it at your registrar exactly as displayed, then press **Refresh** in Vercel.
+
+> **Why this happens on a freshly bought domain:** a previous owner may have used
+> it on Vercel. Their leftover certificate can still be served from Vercel's
+> shared edge, so `openssl s_client` returns a real certificate for your domain
+> that is months out of date — and browsers show `certificate has expired` or a
+> security warning. That is the *old* owner's certificate, not a failure of
+> yours. Vercel issues a fresh one only after verification.
+
+Wait for **Valid Configuration** on all three domains. Allow a few minutes after
+verification for the new certificate — a warning immediately afterwards is
+usually the expired one still cached at the edge, not a new problem.
 
 Confirm before continuing:
 
 ```bash
-curl -s -o /dev/null -w "app  %{http_code}\n" https://leadeasygen.com
+curl -s -o /dev/null -w "app  %{http_code}\n" -L https://www.leadeasygen.com
 curl -s -o /dev/null -w "api  %{http_code}\n" https://api.leadeasygen.com/health
 ```
 
@@ -100,9 +138,11 @@ Under **Authorized redirect URIs**, *add*:
 https://api.leadeasygen.com/auth/google/callback
 ```
 
-Under **Authorized JavaScript origins**, *add*:
+Under **Authorized JavaScript origins**, *add* the canonical host — and the
+apex as well, so a flip later does not require another Console edit:
 
 ```
+https://www.leadeasygen.com
 https://leadeasygen.com
 ```
 
@@ -119,7 +159,7 @@ Google can take a few minutes to apply changes.
 **Vercel → leadeasygen-api → Settings → Environment Variables** (Production):
 
 ```
-FRONTEND_URL        = https://leadeasygen.com
+FRONTEND_URL        = https://www.leadeasygen.com     # the CANONICAL host — see Step 0
 GOOGLE_REDIRECT_URI = https://api.leadeasygen.com/auth/google/callback
 PUBLIC_API_URL      = https://api.leadeasygen.com
 ```
@@ -187,7 +227,7 @@ curl -s -X POST https://api.leadeasygen.com/internal/cron/purge \
 
 ### 6b. Sign in with Google
 
-Use a real browser against `https://leadeasygen.com`. This exercises the whole
+Use a real browser against the canonical host (`https://www.leadeasygen.com`). This exercises the whole
 chain at once: CORS from the new origin, the OAuth state cookie, the redirect back
 through `FRONTEND_URL`, and the session cookie on the new domain.
 
@@ -226,6 +266,9 @@ of the signals filters actually weigh.
 | Stripe deliveries show **400** | endpoint was recreated, so the secret changed | update `STRIPE_WEBHOOK_SECRET`, redeploy — or revert to editing |
 | `registration.registered: false` | Stripe URL ≠ `PUBLIC_API_URL` | compare both for a trailing slash |
 | Domain stuck on *Invalid Configuration* | DNS not propagated | `dig api.leadeasygen.com` and wait |
+| **Verification Required** while `dig` looks correct | ownership not proved | add the `_vercel` TXT record — Step 1b |
+| `certificate has expired` / browser security warning | a previous owner's certificate still served from Vercel's edge | complete verification; a fresh certificate follows |
+| `curl` returns `000` but `openssl` shows a certificate | TLS terminates, Vercel will not route an unverified domain | Step 1b |
 
 ---
 
