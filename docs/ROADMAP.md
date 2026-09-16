@@ -34,7 +34,7 @@ subscription badly enough that few users would ever rationally subscribe.
 | **P2** | Structured logging in the API | 3 | An incident today gives a stack trace and nothing else |
 | **P2** | Per-endpoint webhook warning | 3 | Known gap in what shipped 2026-09-15 |
 | **P2** | `subscriberId: string \| null` | 3 | Root cause of the crash we patched at one call site |
-| **P3** | Card-reuse revocation | 4 | Deliberately deferred; gate catches the volume case |
+| **P3** | Trial farming — decide the trial policy | 4 | Nobody holds one yet, so changing it is free today |
 | **P3** | Trigger scrape on publish | 4 | Parked by choice; 1-minute cron is adequate |
 | **P3** | Apple OAuth backend | 4 | Costs $99/yr and nothing forces it for a web app |
 
@@ -264,16 +264,110 @@ time. Breaking change to the normalized shape; wants its own PR and a major bump
 
 These are decisions, not oversights.
 
-### 10. Card-reuse revocation
+### 10. Trial farming — card-reuse revocation
 
-Detecting a reused card *after* checkout and cancelling the trialing
-subscription. Explicitly out of scope at `fonderie.ts:389-394` — the hard,
-money-path piece deserving its own design effort. The checkout gate catches the
-high-volume abuse synchronously and the engine already records the card.
+**Status:** deferred by design, not forgotten. Read this before building it —
+the recommendation is to change the product before writing the code.
 
-> Note: `billing/catalog.ts:44-48` still claims this check exists and revokes
-> trials. That comment describes behaviour that is not implemented and should be
-> corrected — a stale comment asserting protection on a money path will be
+#### First, the state of play (verified 2026-09-16)
+
+**Nobody holds a trial today.** Every `trialing` subscription in the provider is
+a CLI fixture — none carries `subscriberId` metadata, so none came through
+checkout. No real user has ever been granted one.
+
+**But the trial is live in the code.** `catalog.ts` sets `trialDays: 14`, and
+billing's checkout applies it to any subscriber who has not consumed one
+(`checkout.controller.ts:244-249`). The next real checkout gets it.
+
+So the exposure is **latent, not active** — which is the cheap moment to decide.
+Changing the trial policy right now costs nothing and affects no one; changing it
+after customers hold trials means either grandfathering them or taking something
+back.
+
+#### The problem it solves
+
+As configured, a trial grants **14 days of genuinely unlimited scraping**:
+
+| setting | value | consequence |
+|---|---|---|
+| `trialDays` | `14` | two weeks |
+| `policy.activeJobs.limit` | `null` | no concurrency cap |
+| `wallet.rates` | `{}` | **no credit metering — scraping is free** |
+| `'trialing'` in `ENTITLED_STATUSES` | yes | full plan benefits while trialing |
+
+So an abused trial is not a discount, it is the **most valuable thing in the
+product, taken for free, repeatably**. That is what makes this worth defending at
+all.
+
+#### Why the existing gate cannot catch it
+
+`trialCheckoutGate` (`src/risk/gate.ts`) scores velocity, device fingerprint,
+disposable-email domain, IP, and card fingerprint *at checkout time*. Four of
+those five work on a fresh signup. The card does not:
+
+> `cardFingerprint()` can only read a card the subscriber **already has on
+> file**. A brand-new account has no provider customer until checkout completes,
+> so at gate time there is no card to compare.
+
+The card first becomes knowable when the provider reports the trialing
+subscription — i.e. at **webhook time**, after the trial has already been
+granted. Catching it there means *revoking* something already given, which is why
+this is a separate and harder problem than the gate.
+
+Concretely, the surviving hole is: fresh browser profile + different IP + a real
+email domain → unlimited trials on one card.
+
+#### Recommendation: cap the trial before policing it
+
+**The cheapest fix is not detection — it is removing the prize.**
+
+Give the trial a generous but finite allowance (e.g. 50 credits over 14 days)
+instead of uncapped access — or drop `trialDays` altogether if the trial is not
+wanted at all. With nobody currently holding one, either is a one-line change
+with no migration and no affected customer. A genuine evaluator never reaches the ceiling; a
+farmer gets 50 scrapes rather than an uncapped fortnight, and the incentive to
+farm largely disappears.
+
+That is a change in `src/billing/catalog.ts`, not a distributed-systems problem.
+No money-path risk, and no way to revoke a paying customer by mistake.
+
+Doing detection first fixes the expensive half while the prize stays uncapped.
+
+#### When to build the revocation anyway
+
+Build it when there is **evidence of actual farming**, not before. The engine
+already records the card fingerprint on every gated checkout, so abuse is
+detectable retroactively — waiting is not flying blind.
+
+Design reference: branch `fix/trial-risk-durable-enforcement` (PR #6, closed).
+It does **not** merge — it forked before the `@fonderie/risk` migration and
+conflicts with it, including trying to resurrect a deleted `src/risk/signals.ts`.
+Treat it as a design document, not code to land.
+
+Its four findings remain valid against any future implementation:
+
+1. **Concurrency** — serialize on a card-hash advisory lock, doing the
+   reuse-check and the stamp in one locked transaction. Otherwise two accounts
+   sharing a card can both pass the check concurrently.
+2. **Durability / fail-open** — an in-process bus is at-most-once, so a dropped
+   event, a transient provider error, or a crash strands an un-enforced trial.
+   An unresolvable card must **defer, never promote**, and a sweep must re-run
+   enforcement idempotently for every still-pending trialing subscription. The
+   event is an optimization, not the sole trigger.
+3. **Revoke ordering** — `cancelSubscription` must be awaited *before* marking
+   the trial revoked, both inside the locked transaction, so a cancel that throws
+   rolls back and is retried rather than leaving the subscription live and the
+   decision silently swallowed.
+4. **Subscription id** — read the provider subscription id from our own
+   `fonderie_subscriptions` row, not the event payload. A reused card with no
+   cancellable id must defer, never grant.
+
+The governing principle from the risk brick still applies: **decide ≠ enforce.**
+The brick stays pure and answers "is this risky"; the app owns the side effect.
+
+> **Correct this first, whatever you decide:** `billing/catalog.ts:44-48` claims
+> this check exists and revokes trials. It describes behaviour that is not
+> implemented. A stale comment asserting protection on a money path will be
 > trusted by whoever reads it next.
 
 ### 11. Trigger the scrape job on publish
