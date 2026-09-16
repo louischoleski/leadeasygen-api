@@ -25,14 +25,11 @@ subscription badly enough that few users would ever rationally subscribe.
 
 | # | Item | Phase | Why this rank |
 |---|---|---|---|
-| **P0** | Replace the Resend sandbox sender | 1 | No real user can receive verification or reset email |
-| **P0** | One real test-mode subscribe + pack purchase | 1 | The only check that proves money works |
-| **P1** | Set `PUBLIC_API_URL` in Vercel | 2 | The registration alarm is inert without it |
+| **P0** | Finish the Resend cutover — set `SMTP_FROM` | 1 | Domain verified; sender still `resend.dev`, so no real user gets email |
+| **P1** | Re-run the money test on the new domain | 2 | Proven on the old host; endpoints have since moved |
 | **P1** | Close the pack-vs-subscription pricing gap | 2 | Subscriptions are irrational below ~129 scrapes/mo |
 | **P1** | One-time onboarding credit grant | 2 | New users effectively get 3 usable attempts, not 5 |
-| **P1** | Trim the payment endpoint's 6 extra events | 2 | Every subscription event is delivered twice |
 | **P2** | Structured logging in the API | 3 | An incident today gives a stack trace and nothing else |
-| **P2** | Per-endpoint webhook warning | 3 | Known gap in what shipped 2026-09-15 |
 | **P2** | `subscriberId: string \| null` | 3 | Root cause of the crash we patched at one call site |
 | **P3** | Trial farming — decide the trial policy | 4 | Nobody holds one yet, so changing it is free today |
 | **P3** | Trigger scrape on publish | 4 | Parked by choice; 1-minute cron is adequate |
@@ -95,6 +92,24 @@ Apple, so no button renders — correctly. See Phase 4.
   cancelled → `canceled`, with `provider_event_at` advancing at each step
 - Webhook configuration **confirmed correct by the owner on 2026-09-15** — task #22 closed
 
+## Verified in production on 2026-09-16
+
+- **Custom domain live** — `www.leadeasygen.com` (app) and `api.leadeasygen.com`
+  (API), both on Vercel-issued certificates. The apex 308s to `www` through
+  Vercel, not the registrar.
+- Both Stripe endpoints **re-pointed to the new host**, and the registration check
+  reports `ok: true` with no missing and no unexpected events — the duplicate
+  delivery on the payment endpoint is gone (14 events → its correct 8).
+- **`leadeasygen.com` verified in Resend** — DKIM plus `send`/`rsend` return-path
+  CNAMEs live, with the registrar's locked apex SPF untouched and inbound
+  forwarding intact.
+- **Per-endpoint webhook warning shipped** (`@fonderie/billing` 9.3.1) — the
+  unconsumed-event warning now asks "does THIS endpoint consume it?" rather than
+  "does the package anywhere?", which was silent by construction on the
+  double-delivery misconfiguration it was meant to catch.
+- **A real credit-pack purchase credited end to end** (`purchases` 0 → 1) — the
+  payment webhook is now proven by money moving, not by a test event.
+
 ---
 
 # Phase 1 — Launch blockers (P0)
@@ -103,35 +118,56 @@ Stripe webhook configuration was **confirmed good on 2026-09-15** and is no long
 a blocker — both endpoints registered, enabled and complete, all 14 consumed
 events returning 200. What remains is one sender swap and one honest purchase.
 
-### 1. Replace the Resend sandbox sender
+### 1. Finish the Resend cutover
 
 **Blocks:** every transactional email to a real address — verification, password
 reset, receipts, dunning, trial-ending notices.
 
-The sandbox sender only delivers to the account owner. Until the domain is
-verified, a real signup cannot verify their email, which means they cannot use
-the product at all.
+The sandbox sender only delivers to the account owner, so a real signup cannot
+verify their email — which means they cannot use the product at all.
 
-Was blocked on a date that has now passed.
+**The domain is verified** (2026-09-16): DKIM and the `send`/`rsend` return-path
+CNAMEs are live, the registrar's locked apex SPF was never touched, and inbound
+forwarding still works. What remains is the switch itself:
 
-### 2. Set `PUBLIC_API_URL` in Vercel · **P1**
+```
+SMTP_FROM   = LeadEasyGen <hello@leadeasygen.com>
+SMTP_HOST   = smtp.resend.com     SMTP_PORT = 465     SMTP_SECURE = true
+SMTP_USER / SMTP_PASS = Resend credentials
+```
+
+Then redeploy and confirm from the **received message's raw headers** that
+`spf=pass dkim=pass dmarc=pass` — a verified dashboard says the records exist,
+not that a delivered message authenticated.
+
+Full procedure, including the DMARC `v=DMARC1` trap and why Enable Receiving must
+stay off: [CUSTOM-DOMAIN.md](./CUSTOM-DOMAIN.md) Step 7.
+
+### 2. `PUBLIC_API_URL` — done 2026-09-16
 
 ```
 PUBLIC_API_URL=https://leadeasygen-api.vercel.app
 ```
 
-Without it, `/internal/cron/purge` reports
-`registration: { skipped: "PUBLIC_API_URL is not set" }` and the alarm never
-fires. It is **deliberately not inferred from `VERCEL_URL`** — that is the
+Set to `https://api.leadeasygen.com`. The check now runs instead of reporting
+`skipped`, and it earned its keep immediately: it caught the Stripe endpoints
+still pointing at the old host during the migration, without anyone opening the
+dashboard, then confirmed the fix. Kept here for the reasoning. It is **deliberately not inferred from `VERCEL_URL`** — that is the
 per-deployment hostname, so it would never match the registered endpoint and
 would report every event missing on every run. A check that cries wolf teaches
 you to ignore it.
 
 Redeploy after setting it; env vars are read at boot.
 
-### 3. One real end-to-end money test
+### 3. Re-run the money test on the new domain
 
-Everything so far proves *transport*. This proves the *product*.
+**Done once already** (2026-09-16): a real credit-pack purchase credited the
+wallet end to end, `purchases` 0 → 1. That proved the payment webhook with money
+rather than a test event.
+
+It was proven against the OLD host, and the endpoints have since moved to
+`api.leadeasygen.com`. The registration check confirms both are registered and
+complete, but a purchase has not been run since the move. Worth repeating once.
 
 In test mode, with `4242 4242 4242 4242`:
 
@@ -194,23 +230,6 @@ buys exactly the room to get the first two attempts wrong.
 ceiling — at 5/month multi-accounting is not worth anyone's time; at 25 it
 becomes a business. Raising it would undercut the trial-abuse defense.
 
-### 6. Trim the payment endpoint's extra events
-
-`/billing/webhook/payment` is registered for **all 14** events instead of its 8.
-The 6 subscription events are therefore delivered **twice**, once to each
-endpoint. The payment endpoint no-ops on them, so nothing is broken — it is
-wasted deliveries and log noise.
-
-Remove from the payment endpoint in the Stripe dashboard:
-
-```
-customer.subscription.created   customer.subscription.updated
-customer.subscription.deleted   customer.subscription.trial_will_end
-invoice.paid                    invoice.payment_failed
-```
-
----
-
 # Phase 3 — Observability and hardening (P2)
 
 Not blocking launch. These are what make the *next* incident cheap.
@@ -238,13 +257,6 @@ been immediate.
 `{route, eventType, providerEventId, outcome}` → return the event id in error
 responses so Stripe's dashboard shows which delivery failed → wire `LoggerModule`
 into the API (the `X-Request-ID` correlation spine already exists).
-
-### 8. Per-endpoint webhook warning
-
-**Known gap in what shipped on 2026-09-15.** The runtime warning asks *"is this
-event consumed anywhere?"* rather than *"by this endpoint?"* — so it stays silent
-on exactly the double-delivery misconfiguration in item 6. The registration check
-catches it; the warning does not. Needs the route's own event set passed in.
 
 ### 9. `subscriberId: string | null`
 
