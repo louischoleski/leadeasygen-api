@@ -4,7 +4,7 @@ import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
 import { explainDrainFailure } from '@fonderie/events';
-import { messageStats } from '@fonderie/courier';
+import { checkSenderDns, describeSenderDnsProblems, messageStats } from '@fonderie/courier';
 import {
 	BillingModule,
 	StripeProvider,
@@ -592,6 +592,41 @@ export async function configureApp(options: ConfigureAppOptions) {
 					);
 				}
 
+				// The same question again, asked of the domain we send mail AS. SPF,
+				// DKIM and DMARC live in public DNS owned by the registrar; courier
+				// only declares a `from`. A mismatch is not a send failure — the
+				// provider accepts the message and the RECEIVER drops or spam-files
+				// it, so there is no bounce and nothing to read in a log. It reaches
+				// us as "I never got the email", weeks later.
+				//
+				// SMTP_DKIM_SELECTORS and SMTP_RETURN_PATH_DOMAIN are optional but
+				// worth setting: without the selectors the check cannot tell a
+				// provider-owned Return-Path (correct) from an unauthenticated domain
+				// (broken), and it says so rather than guessing.
+				const senderFrom = process.env.SMTP_FROM ?? process.env.SMTP_USER;
+				const senderDns = senderFrom
+					? await checkSenderDns(senderFrom, {
+							...(process.env.SMTP_DKIM_SELECTORS
+								? {
+										dkimSelectors: process.env.SMTP_DKIM_SELECTORS.split(',')
+											.map((x) => x.trim())
+											.filter(Boolean),
+									}
+								: {}),
+							...(process.env.SMTP_RETURN_PATH_DOMAIN
+								? { returnPathDomain: process.env.SMTP_RETURN_PATH_DOMAIN }
+								: {}),
+						}).catch((err) => ({
+							error: err instanceof Error ? err.message : String(err),
+							records: [],
+							ok: false,
+						}))
+					: { skipped: 'no SMTP_FROM / SMTP_USER configured', records: [], ok: true };
+
+				for (const line of describeSenderDnsProblems(senderDns)) {
+					console.error('[courier] sender dns:', line);
+				}
+
 				// Same question as registration, asked of prices instead of events:
 				// does what we declare match what the provider holds? The boot check
 				// above only fires on a cold start, which on serverless is easy to
@@ -632,6 +667,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					registration,
 					prices,
 					migrations,
+					senderDns,
 					email,
 					queue: {
 						dead: dead.length,
