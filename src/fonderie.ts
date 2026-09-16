@@ -12,6 +12,7 @@ import {
 	checkPriceConsistency,
 	checkWebhookRegistration,
 	describePriceProblems,
+	describeWebhookProblems,
 	webhookStats,
 } from '@fonderie/billing';
 import type { ResolveRecipient } from '@fonderie/billing';
@@ -578,11 +579,16 @@ export async function configureApp(options: ConfigureAppOptions) {
 
 				// Loud in the log as well as in the response: a cron that only ever
 				// gets read when someone goes looking is not an alarm.
-				if (!registration.ok) {
-					console.error(
-						'[billing] webhook registration is incomplete — events we handle will NEVER arrive:',
-						JSON.stringify(registration.endpoints),
-					);
+				//
+				// Read through describeWebhookProblems rather than `registration.ok`,
+				// because the two are no longer the same question. `ok` answers "will
+				// the events arrive"; an endpoint registered at a DIFFERENT API version
+				// than the client pins still delivers, but the payload is shaped
+				// differently — which is how invoice webhooks went quiet without a
+				// single failed delivery. That one has to be reported even though
+				// `ok` is true.
+				for (const line of describeWebhookProblems(registration)) {
+					console.error('[billing] webhook:', line);
 				}
 
 				return res.json({
