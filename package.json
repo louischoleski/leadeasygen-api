@@ -23,7 +23,7 @@
 		"@fonderie/auth": "^7.7.0",
 		"@fonderie/billing": "^9.3.1",
 		"@fonderie/core": ">=0.15.0",
-		"@fonderie/courier": "^7.2.1",
+		"@fonderie/courier": "^7.3.0",
 		"@fonderie/events": "^5.5.0",
 		"@fonderie/media": "^0.2.7",
 		"@fonderie/rate-limit": "^4.0.10",
