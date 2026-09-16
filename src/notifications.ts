@@ -64,6 +64,12 @@ export function buildCourierModule(store: IStoreAdapter, bus: EventBus): Courier
 	const emailOnly = ['email'] as const;
 	return new CourierModule(
 		{
+			// The product name in the email shell. Recipients signed up for
+			// LeadEasyGen and have never heard of Fonderie, so a shell headed
+			// "Fonderie" reads as a different company at best — and as phishing at
+			// worst, which is the wrong signal on a receipt. Unset would fall back
+			// to Fonderie, which is exactly what this exists to prevent.
+			brandName: 'LeadEasyGen',
 			channels: {
 				// DERIVED from each package's own key list, never hand-written. A
 				// hand-written map silently drops anything added upstream: courier
