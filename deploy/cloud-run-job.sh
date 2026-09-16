@@ -153,6 +153,27 @@ fi
 echo "→ schedule"
 SA="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
 URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${JOB}:run"
+
+# Let the scheduler actually START the job.
+#
+# Creating the schedule does NOT grant it permission to run anything, and the
+# failure is silent in the worst way: Scheduler reports ENABLED, lastAttemptTime
+# advances every minute, and the job simply never executes. Nothing appears in
+# the job's execution list, so the queue stops draining while every dashboard
+# says the schedule is healthy. The only place the truth shows is the scheduler
+# job's `status.code: 7` (PERMISSION_DENIED), which nobody thinks to read.
+#
+# That is exactly what happened here: the schedule was created in this script
+# but never authorized, so it never once ran. The single successful execution on
+# record was a manual `gcloud run jobs execute` during an incident.
+#
+# Idempotent, so re-running this script re-asserts the binding — a job deleted
+# and recreated loses its IAM policy along with it.
+gcloud run jobs add-iam-policy-binding "$JOB" \
+	--region "$REGION" --project "$PROJECT" \
+	--member "serviceAccount:${SA}" \
+	--role roles/run.invoker --quiet >/dev/null
+echo "  granted run.invoker to $SA"
 if gcloud scheduler jobs describe "${JOB}-schedule" --location "$REGION" --project "$PROJECT" >/dev/null 2>&1; then
 	gcloud scheduler jobs update http "${JOB}-schedule" \
 		--location "$REGION" --project "$PROJECT" --schedule "$SCHEDULE" \
@@ -163,6 +184,26 @@ else
 		--location "$REGION" --project "$PROJECT" --schedule "$SCHEDULE" \
 		--uri "$URI" --http-method POST \
 		--oauth-service-account-email "$SA" --quiet
+fi
+
+# Report what the schedule's LAST ATTEMPT actually did, not merely that a
+# schedule exists. `state: ENABLED` is not evidence of anything — a schedule
+# that is refused every minute stays ENABLED forever. status.code 7 is
+# PERMISSION_DENIED; an empty status means the last attempt was accepted.
+echo
+echo "→ verifying the schedule can actually start the job"
+CODE="$(gcloud scheduler jobs describe "${JOB}-schedule" --location "$REGION" \
+	--project "$PROJECT" --format='value(status.code)' 2>/dev/null)"
+if [ -z "$CODE" ]; then
+	echo "  ok — last attempt was accepted (no error on the schedule)"
+elif [ "$CODE" = "7" ]; then
+	echo "  FAILING: PERMISSION_DENIED (7). The schedule is enabled and being refused."
+	echo "  The job will never run and the queue will not drain, silently."
+	echo "  Check: gcloud run jobs get-iam-policy $JOB --region $REGION"
+	exit 1
+else
+	echo "  FAILING: the schedule's last attempt returned status code $CODE"
+	exit 1
 fi
 
 echo
