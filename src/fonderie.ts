@@ -9,7 +9,9 @@ import {
 	BillingModule,
 	StripeProvider,
 	SUPPORTED_PAYMENT_OPTIONS,
+	checkPriceConsistency,
 	checkWebhookRegistration,
+	describePriceProblems,
 	webhookStats,
 } from '@fonderie/billing';
 import type { ResolveRecipient } from '@fonderie/billing';
@@ -336,6 +338,34 @@ export async function configureApp(options: ConfigureAppOptions) {
 
 		const fonderie = await fonderieApp.boot();
 
+		// The catalog declares a price AND Stripe holds one, and which of the two
+		// the customer actually pays depends on the purchase path: hosted checkout
+		// charges Stripe's price, while the saved-card and auto-recharge paths
+		// charge the catalog's priceAmount/currency. Nothing made them agree, and
+		// the failure is silent — each path is internally consistent, so the only
+		// symptom is that the same pack costs different amounts depending on how
+		// it was bought. (It really happened: the catalog said usd against Stripe
+		// prices in cad, same figures, ~37% apart.)
+		//
+		// Deliberately fire-and-forget: reading prices is a network call, and a
+		// diagnostic must not delay or fail a boot. Skipped without a real key —
+		// the provider above falls back to a placeholder, and a check that cries
+		// wolf on every local run is a check people learn to ignore.
+		if (process.env.STRIPE_SECRET_KEY) {
+			void checkPriceConsistency(stripeProvider, {
+				plans: PLANS,
+				wallet: { creditPacks: CREDIT_PACKS },
+			})
+				.then((report) => {
+					for (const line of describePriceProblems(report)) {
+						console.error('[billing] price mismatch:', line);
+					}
+				})
+				.catch((err) => {
+					console.error('[billing] price check failed:', err);
+				});
+		}
+
 		// mount() wires body parsing, context (bridge), and the auth routes onto
 		// Express. bridge runs first, so custom routes added below see req._fonderie.
 		// BEFORE mount(): the catch-all would otherwise serve the package's
@@ -526,6 +556,26 @@ export async function configureApp(options: ConfigureAppOptions) {
 						}))
 					: { skipped: 'PUBLIC_API_URL is not set', endpoints: [], ok: true };
 
+				// Same question as registration, asked of prices instead of events:
+				// does what we declare match what the provider holds? The boot check
+				// above only fires on a cold start, which on serverless is easy to
+				// miss entirely — so it is also reported here, where the queue and
+				// registration state already get read.
+				const prices = process.env.STRIPE_SECRET_KEY
+					? await checkPriceConsistency(stripeProvider, {
+							plans: PLANS,
+							wallet: { creditPacks: CREDIT_PACKS },
+						}).catch((err) => ({
+							error: err instanceof Error ? err.message : String(err),
+							entries: [],
+							ok: false,
+						}))
+					: { skipped: 'STRIPE_SECRET_KEY is not set', entries: [], ok: true };
+
+				for (const line of describePriceProblems(prices)) {
+					console.error('[billing] price mismatch:', line);
+				}
+
 				// Loud in the log as well as in the response: a cron that only ever
 				// gets read when someone goes looking is not an alarm.
 				if (!registration.ok) {
@@ -539,6 +589,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					ok: true,
 					billing,
 					registration,
+					prices,
 					email,
 					queue: {
 						dead: dead.length,
