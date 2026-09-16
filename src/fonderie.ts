@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { FonderieApp, defineConfig, installPlatformBackgroundRunner, isServerlessRuntime } from '@fonderie/core';
-import { PGAdapter } from '@fonderie/store';
+import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
 import { explainDrainFailure } from '@fonderie/events';
@@ -30,6 +30,7 @@ import {
 } from './auth/googleWeb.js';
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
+import { MIGRATION_STEPS } from './db/migrations/steps.js';
 import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
 import { trialCheckoutGate } from './risk/gate.js';
 
@@ -557,6 +558,40 @@ export async function configureApp(options: ConfigureAppOptions) {
 						}))
 					: { skipped: 'PUBLIC_API_URL is not set', endpoints: [], ok: true };
 
+				// Deployed code routinely goes live AHEAD of its migrations, because
+				// they run out of band (npm run migrate, once per deploy, against the
+				// direct connection). Nothing fails at deploy time — the gap only
+				// surfaces when some request happens to touch the new column, and the
+				// symptom looks nothing like the cause: a queue that will not drain, a
+				// callback that hangs, a health route that 500s. Each gets diagnosed
+				// separately, none of them mentions migrations.
+				//
+				// MigrationRunner.pending() answers it directly and read-only. It has
+				// existed for exactly this since the runner was written; nothing had
+				// ever called it.
+				type MigrationState =
+					| { name: string; pending: number; files: string[] }
+					| { name: string; error: string };
+				const migrations: MigrationState[] = await Promise.all(
+					MIGRATION_STEPS.map(async ([name, path]): Promise<MigrationState> => {
+						try {
+							const files = await new InternalMigrationRunner(store, path).pending();
+							return { name, pending: files.length, files };
+						} catch (err) {
+							// One unreadable set must not blind the report to the others.
+							return { name, error: err instanceof Error ? err.message : String(err) };
+						}
+					}),
+				);
+				for (const m of migrations) {
+					if (!('pending' in m) || m.pending === 0) continue;
+					console.error(
+						`[store] ${m.name}: ${m.pending} migration(s) NOT applied — code is live ahead ` +
+							`of the schema: ${m.files.join(', ')}. ` +
+							'Run `npm run migrate` against the direct connection.',
+					);
+				}
+
 				// Same question as registration, asked of prices instead of events:
 				// does what we declare match what the provider holds? The boot check
 				// above only fires on a cold start, which on serverless is easy to
@@ -596,6 +631,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					billing,
 					registration,
 					prices,
+					migrations,
 					email,
 					queue: {
 						dead: dead.length,

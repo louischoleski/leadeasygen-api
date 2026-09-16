@@ -1,14 +1,7 @@
 import 'dotenv/config';
 import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
-import { getMigrationsPath as authMigrationsPath } from '@fonderie/auth/migrations';
-import { getMigrationsPath as eventsMigrationsPath } from '@fonderie/events/migrations';
-import { getMigrationsPath as courierMigrationsPath } from '@fonderie/courier/migrations';
-import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/migrations';
-import { getMigrationsPath as mediaMigrationsPath } from '@fonderie/media/migrations';
-import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/migrations';
-import { getMigrationsPath as riskMigrationsPath } from '@fonderie/risk/migrations';
 
-import { getAppMigrationsPath } from './db/migrations/index.js';
+import { MIGRATION_STEPS } from './db/migrations/steps.js';
 
 /**
  * Schema owner for deployments that don't migrate at boot — i.e. serverless,
@@ -20,9 +13,9 @@ import { getAppMigrationsPath } from './db/migrations/index.js';
  *
  *   DATABASE_URL=<direct-connection> npm run migrate
  *
- * Order matters: auth owns fonderie_users, which the app migration extends,
- * and media's assets reference storage's blobs. Same sequence the long-lived
- * server runs at boot, kept here as the single source of truth.
+ * The sequence itself lives in ./db/migrations/steps.ts, shared with the ops
+ * route that REPORTS which of them a database is missing — one list, so the
+ * applier and the reporter cannot disagree about what exists.
  */
 async function main() {
 	const databaseUrl = process.env.DATABASE_URL;
@@ -36,18 +29,7 @@ async function main() {
 		throw new Error('Cannot connect to the database — check DATABASE_URL.');
 	}
 
-	const steps: Array<[string, string]> = [
-		['auth', authMigrationsPath()],
-		['events', eventsMigrationsPath()],
-		['app', getAppMigrationsPath()],
-		['risk', riskMigrationsPath()],
-		['courier', courierMigrationsPath()],
-		['billing', billingMigrationsPath()],
-		['storage', storageMigrationsPath()],
-		['media', mediaMigrationsPath()],
-	];
-
-	for (const [name, path] of steps) {
+	for (const [name, path] of MIGRATION_STEPS) {
 		process.stdout.write(`  ${name} … `);
 		await new InternalMigrationRunner(store, path).run();
 		console.log('done');
