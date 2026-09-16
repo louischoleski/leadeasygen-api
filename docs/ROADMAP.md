@@ -37,6 +37,7 @@ subscription badly enough that few users would ever rationally subscribe.
 | **P3** | Trial farming — decide the trial policy | 4 | Nobody holds one yet, so changing it is free today |
 | **P3** | Trigger scrape on publish | 4 | Parked by choice; 1-minute cron is adequate |
 | **P3** | Apple OAuth backend | 4 | Costs $99/yr and nothing forces it for a web app |
+| **P3** | Email open tracking | 4 | Designed; Phase 2 blocked on a missing owner column |
 
 ---
 
@@ -393,6 +394,116 @@ The UI is ready and inert either way.
 Also note: the web flow needs a **verified HTTPS domain** with an exact
 registered return URL, so localhost cannot test it — unlike Google. And Apple
 returns the user's name only on the *first* authorization, never again.
+
+---
+
+### 13. Email open tracking
+
+**Status:** designed, unbuilt. The design is the deliverable here — the ordering
+constraint and the ownership gap below are both easy to miss and expensive to
+discover late.
+
+#### What it solves
+
+"Did the customer see the invoice?" For CrewFinding especially, knowing whether
+to chase a customer has real operational value.
+
+A link to a hosted page does **not** answer this: a click measures *engagement*,
+not reading, and most people who read an invoice never click anything. A pixel is
+passive, which is why it is the right instrument despite being noisier.
+
+#### What the signal is actually worth
+
+| client | when images load | open signal |
+|---|---|---|
+| Gmail | on user open, via proxy | **real** (no usable IP, caching flattens repeats) |
+| Outlook desktop/web | on user open | **real**, unless images are blocked |
+| Apple Mail + MPP | **at delivery**, always | **false positive** |
+
+Only Apple pre-fetches. Gmail opens are genuine — a common misreading, and it
+undersells the feature. Net: reliable for most business recipients, with one
+known false-positive class that must never be hidden from the UI.
+
+Label the field **"opened or prefetched"**, never "read". A UI claiming certainty
+will have someone chasing a customer who never looked.
+
+#### Phase 1 — the mechanism (small)
+
+**The ordering constraint.** `dispatch()` resolves the template *before* it
+inserts the per-channel log row, so the token cannot be the log row's id. Generate
+it first:
+
+```
+generate openToken → resolve() → insertMessageLog({ openToken }) → send
+```
+
+**Schema** — extend `fonderie_message_log`: `open_token TEXT UNIQUE` (~10 random
+bytes, base64url, 14 chars), `opened_at` (first open only), `open_count`. Partial
+index on `open_token WHERE NOT NULL`.
+
+The token must be **unguessable, not merely unique** — a short sequential id lets
+anyone walk `/o/1.gif`, `/o/2.gif` and mark every message opened, silently
+destroying the data. Keep it opaque: never encode the address or a user id, since
+the URL rides through forwards, scanners and logs you do not control.
+
+Give it its own column rather than reusing `id`, so the internal primary key is
+never published and the token can be rotated or nulled.
+
+**No IP column at all** — absent, not nullable, so it cannot be added casually.
+For Gmail and Apple the captured IP is a *proxy's*, so storing it means holding
+regulated personal data that is factually wrong about the person: maximum cost,
+no analytical value. If geography is ever needed, truncate (/24, /48) rather than
+storing the address.
+
+**Route** — `GET /courier/o/:token.gif`, unauthenticated by necessity. Return the
+**same bytes and same status whether the token resolves or not**; differing
+responses make the endpoint an oracle for probing which tokens exist.
+
+**Config** — `email.trackOpens` (default **false**) and `email.publicUrl`. Emails
+need absolute URLs and courier does not know its own host. **Fail at boot** when
+tracking is on and the URL is missing — the same class of bug as `PUBLIC_API_URL`,
+where a silent default looks configured and is not.
+
+**Layout** — an `{{openPixel}}` slot, empty when tracking is off. A custom
+`_layout.html` that omits it simply never tracks, which is the correct default:
+an app that owns its shell owns that decision.
+
+Accept knowingly that the shell currently has **no images**, which is a real
+deliverability asset that this spends.
+
+#### Phase 2 — the user-facing view (substantially larger)
+
+**Admin permission answers the wrong question.** Courier has exactly two route
+families — `/admin/templates/*` behind an admin token, and `/courier/delivery/*`
+for inbound provider webhooks. It has **never had a session-authenticated route**.
+The admin token is a server secret and cannot be handed to app users, so gating
+opens behind it lets the operator see open rates while a CrewFinding user still
+cannot see whether their own customer opened their own invoice — which was the
+entire motivation.
+
+**The blocker: `fonderie_message_log` has no owner.** Columns are `message_type,
+channel, recipient, locale, status, error, attempts, created_at, sent_at`, and
+`insertMessageLog` persists only those. "Show me opens for messages I sent" is
+unanswerable at any auth level — there is nothing to scope by. Filtering on the
+`recipient` string would let any user read any message sent to that address,
+which is worse than no feature.
+
+So the user-facing version is: add an owner column, thread it from
+`ICourierMessage` through the dispatcher into the log, then build session-
+authenticated workspace-scoped routes — the shape `@fonderie/audit` already has.
+
+**Frontend cost, if built:** a new session sub-client plus react / react-native /
+vue mirrors. Note the admin path would NOT need react-native — `courier-admin`
+deliberately ships no React Native package, since a template editor is a desktop
+surface.
+
+#### Recommended order
+
+Phase 1 with the **admin** view first. It is small, it proves the pixel against
+real clients, and it reveals whether Apple MPP noise leaves a signal worth the
+user-facing build — at a fraction of the cost. Phase 2 is a real feature, not an
+add-on, and it is the one with a privacy dimension: it exposes recipient
+behaviour to your customers' users.
 
 ---
 
