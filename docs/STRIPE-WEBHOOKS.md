@@ -273,21 +273,46 @@ Then do one real transaction with a real card and refund it.
 
 ---
 
-## Local development
+## Local development — do this instead of deploying
 
-The Stripe CLI forwards real events to localhost without any public URL:
-
-```bash
-stripe listen --forward-to localhost:3000/billing/webhook
-stripe listen --forward-to localhost:3000/billing/webhook/payment
-```
-
-Each prints its own `whsec_…` for `.env`. Trigger events with:
+The Stripe CLI forwards real events from your account to localhost, so the loop
+is **seconds instead of a deploy**. Signature verification, handlers and database
+are all identical to production; only the URL differs.
 
 ```bash
-stripe trigger customer.subscription.created
-stripe trigger payment_intent.succeeded
+scripts/dev-stripe.sh up      # migrations + API + both forwards
+scripts/stripe-sweep.sh       # fire all 14 events, report every status
+scripts/dev-stripe.sh down
 ```
+
+`up` refuses to start against a `sk_live_` key — the sweep creates real
+subscriptions, charges and disputes, and `stripe trigger` offers no undo.
+
+**`.env` is never modified.** The app reads the CLI's signing secret from inline
+environment variables, which win because dotenv does not overwrite an entry
+already present in `process.env`. Note that one CLI secret serves *both*
+endpoints locally, unlike production where each dashboard endpoint has its own —
+and that a production endpoint's secret could never verify a CLI-forwarded
+signature anyway.
+
+Each endpoint gets only the events it owns, mirroring the two dashboard
+endpoints. Without that filter a single `listen` forwards everything to both and
+`checkout.session.completed` gets processed twice.
+
+### Reading the sweep
+
+Any **non-2xx is a real failure**. A 2xx carrying `ignored` is **success**: the
+signature verified and the handler declined an event referencing a Stripe object
+with no counterpart in this database.
+
+One fixture fans out into several events — triggering a subscription update also
+emits `invoice.paid` and `customer.subscription.created` — so expect more
+deliveries than triggers.
+
+**`charge.dispute.closed` never arrives.** The fixture opens a dispute, and
+Stripe closes disputes asynchronously, so nothing emits the close event. That
+handler is the one path this sweep cannot cover; verify it with a real disputed
+payment in test mode if you need it.
 
 ---
 
