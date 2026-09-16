@@ -99,6 +99,19 @@ export function buildCourierModule(store: IStoreAdapter, bus: EventBus): Courier
 			email: {
 				provider: 'smtp',
 				from: process.env.SMTP_FROM ?? process.env.SMTP_USER!,
+				// Where replies go, because the From address cannot receive them.
+				//
+				// Mail is sent from email.leadeasygen.com — a dedicated sending
+				// subdomain, so its reputation is isolated from the apex that serves
+				// the site and forwards the inbox. A sending subdomain has no MX, so
+				// a reply to the From address bounces.
+				//
+				// People do reply to transactional mail: a question about a receipt,
+				// a "this wasn't me" about a password reset. A bounced reply is worse
+				// than no reply — the sender believes they reached us and never tries
+				// another way. Point them at the apex address, which Namecheap
+				// forwarding actually delivers.
+				...(process.env.SMTP_REPLY_TO ? { replyTo: process.env.SMTP_REPLY_TO } : {}),
 				smtp: {
 					host: process.env.SMTP_HOST!,
 					port: Number(process.env.SMTP_PORT ?? 587),
