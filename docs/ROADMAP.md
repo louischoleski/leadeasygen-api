@@ -28,10 +28,11 @@ subscription badly enough that few users would ever rationally subscribe.
 | **P0** | Finish the Resend cutover — set `SMTP_FROM` | 1 | Domain verified; sender still `resend.dev`, so no real user gets email |
 | **P1** | Re-run the money test on the new domain | 2 | Proven on the old host; endpoints have since moved |
 | **P1** | Close the pack-vs-subscription pricing gap | 2 | Subscriptions are irrational below ~129 scrapes/mo |
+| **P2** | Decide whether to move the existing subscriber to the USD price | 3 | Prices are USD as of 2026-09-16; an active subscription keeps billing the CAD price it was created with |
 | **P1** | One-time onboarding credit grant | 2 | New users effectively get 3 usable attempts, not 5 |
 | **P2** | Structured logging in the API | 3 | An incident today gives a stack trace and nothing else |
 | **P2** | `subscriberId: string \| null` | 3 | Root cause of the crash we patched at one call site |
-| **P3** | Trial farming — decide the trial policy | 4 | Nobody holds one yet, so changing it is free today |
+| **P3** | Trial farming — decide the trial policy | 4 | Nobody holds one yet, so changing it is free today. The gate DECIDES at checkout and nothing ENFORCES afterwards — prior art at the `superseded/trial-risk-durable-enforcement` tag, to be rebuilt against `@fonderie/risk`, not cherry-picked |
 | **P3** | Trigger scrape on publish | 4 | Parked by choice; 1-minute cron is adequate |
 | **P3** | Apple OAuth backend | 4 | Costs $99/yr and nothing forces it for a web app |
 | **P3** | Email open tracking | 4 | Designed; Phase 2 blocked on a missing owner column |
@@ -109,6 +110,38 @@ Apple, so no button renders — correctly. See Phase 4.
   double-delivery misconfiguration it was meant to catch.
 - **A real credit-pack purchase credited end to end** (`purchases` 0 → 1) — the
   payment webhook is now proven by money moving, not by a test event.
+
+## Shipped 2026-09-16 (later) — the silent-divergence sweep
+
+An audit for one shape — *we declare a value, another system actually holds it,
+and nothing compares the two* — turned up seven instances. Four are now closed,
+each verified against live systems rather than a test double.
+
+- **Invoice webhooks were silently dropped in production.** Both endpoints render
+  payloads at `2026-04-22.dahlia` while the client pins `2024-11-20.acacia`, and
+  Stripe had moved the subscription and PaymentIntent off the Invoice object in
+  between. Both normalized to `null`, and the controller answered `200 ignored`
+  — a *successful* delivery as far as Stripe is concerned, so nothing retried and
+  nothing logged. Renewal receipts and the `invoicePaid` /
+  `invoicePaymentFailed` events stopped. Dunning email survived (different
+  object). Subscription state was **not** corrupted — the new drift check reports
+  `checked:1 drifted:0`. Fixed in `@fonderie/billing` 9.6.0; see
+  [STRIPE-WEBHOOKS.md](STRIPE-WEBHOOKS.md).
+- **The ops route now answers the same question five ways** — `registration`
+  (including the endpoint's API version), `prices`, `migrations`, `senderDns`,
+  `subscriptions`. Every one is a place we hold a copy of something another
+  system owns.
+- **Migration drift is visible.** `MigrationRunner.pending()` had existed,
+  documented and tested, and was called by nothing. It is now reported per set —
+  which matters here precisely because migrations run out of band, so code
+  routinely goes live ahead of the schema.
+- **The sending domain is checked against DNS** (`@fonderie/courier` 7.6.0).
+  Standing finding: `leadeasygen.com` publishes DMARC `p=none`, so a forged
+  sender is still delivered. Fine while `rua` reports are being read; worth
+  moving to `quarantine`.
+- **Subscription drift is detectable** (`@fonderie/billing` 9.7.0). The provider
+  seam had update, cancel and reactivate but no way to *read* a subscription
+  back, so the webhook-fed mirror could never be checked against what it mirrors.
 
 ---
 
@@ -212,6 +245,22 @@ exists, which would explain the gap.
 **Options:** raise pack prices (~$0.70–0.90/credit puts break-even near 55–70
 scrapes), or reintroduce a mid-tier around $19–25. **Not** by cutting the free
 allowance — see below.
+
+> **Resolved 2026-09-16 — the currency, not the ratio.** Separately from the
+> break-even question above, the catalog declared `usd` while every Stripe price
+> was `cad`. Same figures, so nothing ever errored — but hosted checkout charged
+> the Stripe price while the in-app card and auto-recharge charged the catalog's,
+> so the same pack cost different amounts depending on how it was bought.
+> Resolved in favour of **USD**: the catalog was right. New USD prices were
+> created (a Price's currency is immutable) via
+> `scripts/stripe-prices-to-usd.mjs`, and the ops route now reports
+> `prices.ok: true`.
+>
+> Note what this did and did not change: hosted checkout moved from CA$ to US$ at
+> the same numbers — a real rise in what those buyers pay — while the in-app path
+> was **already** charging USD and is unchanged. The table above was always in
+> USD terms, so the break-even analysis stands as written. Existing subscribers
+> keep billing the price they signed up on until moved deliberately.
 
 ### 5. A one-time onboarding grant
 

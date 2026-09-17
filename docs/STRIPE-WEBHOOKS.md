@@ -99,6 +99,44 @@ invoice.payment_failed
 This endpoint drives the Unlimited plan: activation, renewal receipts, dunning,
 cancellation, and the trial-ending heads-up.
 
+### Note the endpoint's API version — it is not the one our code pins
+
+When Stripe creates an endpoint it stamps it with an **API version**, and every
+payload delivered there is rendered in *that* version. It has nothing to do with
+the version our client pins (`STRIPE_API_VERSION` in `@fonderie/billing`), and
+nothing keeps the two in step: one lives in the dashboard, the other in code.
+
+This is not theoretical. Both production endpoints were created at
+`2026-04-22.dahlia` while the client pinned `2024-11-20.acacia` — 17 months
+apart — and Stripe had moved two fields off the Invoice object in between:
+
+| | pre-2025 | 2025+ |
+|---|---|---|
+| subscription | `invoice.subscription` | `invoice.parent.subscription_details.subscription` |
+| PaymentIntent | `invoice.payment_intent` | `invoice.payments[].payment.payment_intent` |
+
+The normalizer read only the old locations, so both came back `null` and the
+controller answered `200 {ignored:'no-matching-subscription'}` — which Stripe
+records as a **successful delivery**. No retry, no error, nothing logged.
+Renewal receipts and the `invoicePaid` / `invoicePaymentFailed` events simply
+stopped. Dunning email survived only because it rides
+`customer.subscription.updated`, a different object that did not change shape.
+
+Fixed in `@fonderie/billing` 9.6.0, which reads both shapes and re-reads the
+invoice when a payload cannot carry the PaymentIntent at all. **The version gap
+itself is now reported** rather than trusted — the ops route returns
+`apiVersionMismatch` per endpoint:
+
+```bash
+curl -s -X POST https://api.leadeasygen.com/internal/cron/purge \
+  -H "Authorization: Bearer $CRON_SECRET" | jq '.registration'
+```
+
+A mismatch does **not** fail `registration.ok`: the events do arrive, they are
+just shaped differently, and a permanently-red check is one people stop reading.
+It is reported as its own line instead. Treat it as a standing note to check
+release notes when Stripe moves a field, not as an outage.
+
 ---
 
 ## Step 3 — Register the payment endpoint
