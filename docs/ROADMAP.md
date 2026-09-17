@@ -413,9 +413,35 @@ Doing detection first fixes the expensive half while the prize stays uncapped.
 
 #### When to build the revocation anyway
 
-Build it when there is **evidence of actual farming**, not before. The engine
-already records the card fingerprint on every gated checkout, so abuse is
-detectable retroactively — waiting is not flying blind.
+Build it when there is **evidence of actual farming**, not before.
+
+**Corrected 2026-09-17 — the safety net is thinner than this said.** The claim
+used to be that the engine records the card fingerprint on every gated checkout,
+so abuse stays retroactively detectable. That is true only for a user who
+**already has a card on file**. `cardFingerprint()` reads
+`fonderie_wallet_customers` and returns null when there is no Stripe customer yet
+— and `gate.ts` says so itself: *"a fresh signup has no Stripe customer yet, so
+this is usually null at gate time."*
+
+A first trial is exactly that case. So the card — the strongest cross-account
+identifier — is **null for the population farming would come from**. What does
+record on every assessment is `device`, `ip` and `email-domain`, which is not
+nothing: shared-device and shared-IP reuse still surface. But retroactive
+detection *by card* would be blind to first-time trials, and the deferral should
+be made knowing that, not on the stronger claim.
+
+**Measured 2026-09-17:** `risk_events` holds **zero** `trial.start` assessments.
+Nobody has taken a trial, so there is no farming to detect and no data to
+validate enforcement against — which is the strongest argument for waiting, and a
+better one than the card claim was.
+
+**If you want the net to actually hold while you wait**, the minimal change is to
+record the card fingerprint *after* checkout completes, when Stripe first reports
+the subscription and its payment method — recording only, no enforcement, no
+revocation. That is a fraction of the work of the full enforcement path, keeps
+the decide-later stance intact, and removes the blind spot. Prior art for the
+shape (not the code — it predates the brick) is at the
+`superseded/trial-risk-durable-enforcement` tag.
 
 Design reference: branch `fix/trial-risk-durable-enforcement` (PR #6, closed).
 It does **not** merge — it forked before the `@fonderie/risk` migration and
