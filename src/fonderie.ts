@@ -573,19 +573,46 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// ever called it.
 				type MigrationState =
 					| { name: string; pending: number; files: string[] }
-					| { name: string; error: string };
-				const migrations: MigrationState[] = await Promise.all(
+					| { name: string; error: string; code?: string };
+				let migrations: MigrationState[] | { unavailable: string } = await Promise.all(
 					MIGRATION_STEPS.map(async ([name, path]): Promise<MigrationState> => {
 						try {
 							const files = await new InternalMigrationRunner(store, path).pending();
 							return { name, pending: files.length, files };
 						} catch (err) {
 							// One unreadable set must not blind the report to the others.
-							return { name, error: err instanceof Error ? err.message : String(err) };
+							const code = (err as { code?: string } | null)?.code;
+							return {
+								name,
+								error: err instanceof Error ? err.message : String(err),
+								...(code ? { code } : {}),
+							};
 						}
 					}),
 				);
-				for (const m of migrations) {
+
+				// EVERY set failing to even open its directory is one environment
+				// problem, not eight migration problems. Reporting it eight times
+				// buries the distinction and reads like the schema is on fire.
+				//
+				// The cause is specific and worth naming: .sql files are read with
+				// readdir() at runtime, so the serverless bundler cannot see them and
+				// prunes them — the check then cannot tell "up to date" from "cannot
+				// look", which is worse than not running it at all.
+				if (
+					Array.isArray(migrations) &&
+					migrations.length > 0 &&
+					migrations.every((m) => 'code' in m && m.code === 'ENOENT')
+				) {
+					migrations = {
+						unavailable:
+							'migration .sql files are not present in this deployment bundle, so pending ' +
+							'migrations cannot be counted here. They are read with readdir() at runtime, ' +
+							'which the bundler cannot trace — see vercel.json `functions.includeFiles`.',
+					};
+					console.error('[store] migration check unavailable:', migrations.unavailable);
+				}
+				for (const m of Array.isArray(migrations) ? migrations : []) {
 					if (!('pending' in m) || m.pending === 0) continue;
 					console.error(
 						`[store] ${m.name}: ${m.pending} migration(s) NOT applied — code is live ahead ` +
