@@ -10,8 +10,10 @@ import {
 	StripeProvider,
 	SUPPORTED_PAYMENT_OPTIONS,
 	checkPriceConsistency,
+	checkSubscriptionDrift,
 	checkWebhookRegistration,
 	describePriceProblems,
+	describeSubscriptionDrift,
 	describeWebhookProblems,
 	webhookStats,
 } from '@fonderie/billing';
@@ -592,6 +594,26 @@ export async function configureApp(options: ConfigureAppOptions) {
 					);
 				}
 
+				// And the same question asked of our own subscription mirror.
+				// fonderie_subscriptions is fed entirely by webhooks, so a delivery
+				// window we miss leaves it permanently wrong with nothing able to
+				// notice — an active row for a subscription Stripe cancelled (we give
+				// the product away) or a cancelled row for one Stripe still bills (a
+				// paying customer is locked out). Both are invisible from in here,
+				// because a stale mirror and a correct one look identical.
+				const subscriptions = process.env.STRIPE_SECRET_KEY
+					? await checkSubscriptionDrift(stripeProvider, store).catch((err) => ({
+							error: err instanceof Error ? err.message : String(err),
+							checked: 0,
+							drifted: [],
+							ok: false,
+						}))
+					: { skipped: 'STRIPE_SECRET_KEY is not set', checked: 0, drifted: [], ok: true };
+
+				for (const line of describeSubscriptionDrift(subscriptions)) {
+					console.error('[billing] subscription drift:', line);
+				}
+
 				// The same question again, asked of the domain we send mail AS. SPF,
 				// DKIM and DMARC live in public DNS owned by the registrar; courier
 				// only declares a `from`. A mismatch is not a send failure — the
@@ -668,6 +690,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					prices,
 					migrations,
 					senderDns,
+					subscriptions,
 					email,
 					queue: {
 						dead: dead.length,
