@@ -14,10 +14,12 @@ be metered against a credit wallet, and subscribe. The plumbing that was
 genuinely broken — a webhook that 500'd, OAuth sign-ups that never provisioned a
 workspace, a scrape queue stalled for 22 hours, email that was queued and never
 sent — is fixed and verified in production, and Stripe webhook configuration was
-confirmed good on 2026-09-15. **What stands between here and charging real
-customers is not engineering: it is one email-sender swap and one honest
-end-to-end money test.** The larger open question is not technical at all — the credit packs currently undercut the
-subscription badly enough that few users would ever rationally subscribe.
+confirmed good on 2026-09-15, and the Resend cutover completed on 2026-09-16.
+**What stands between here and charging real customers is now one honest
+end-to-end money test** — on the new domain, and against the USD prices. The
+larger open question is not technical at all: the credit packs currently
+undercut the subscription badly enough that few users would ever rationally
+subscribe.
 
 ---
 
@@ -25,7 +27,7 @@ subscription badly enough that few users would ever rationally subscribe.
 
 | # | Item | Phase | Why this rank |
 |---|---|---|---|
-| **P0** | Finish the Resend cutover — set `SMTP_FROM` | 1 | Domain verified; sender still `resend.dev`, so no real user gets email |
+| ~~P0~~ | ~~Finish the Resend cutover~~ — **done 2026-09-16** | 1 | Production sends as `hello@email.leadeasygen.com`; SPF/DKIM/DMARC all resolve |
 | **P1** | Re-run the money test on the new domain | 2 | Proven on the old host; endpoints have since moved |
 | **P1** | Close the pack-vs-subscription pricing gap | 2 | Subscriptions are irrational below ~129 scrapes/mo |
 | **P2** | Decide whether to move the existing subscriber to the USD price | 3 | Prices are USD as of 2026-09-16; an active subscription keeps billing the CAD price it was created with |
@@ -149,29 +151,43 @@ each verified against live systems rather than a test double.
 
 Stripe webhook configuration was **confirmed good on 2026-09-15** and is no longer
 a blocker — both endpoints registered, enabled and complete, all 14 consumed
-events returning 200. What remains is one sender swap and one honest purchase.
+events returning 200, and the Resend cutover completed on 2026-09-16. What
+remains in this phase is one honest end-to-end purchase.
 
-### 1. Finish the Resend cutover
+### 1. ~~Finish the Resend cutover~~ — done 2026-09-16
 
-**Blocks:** every transactional email to a real address — verification, password
-reset, receipts, dunning, trial-ending notices.
+**Blocked:** every transactional email to a real address — verification,
+password reset, receipts, dunning, trial-ending notices.
 
 The sandbox sender only delivers to the account owner, so a real signup cannot
 verify their email — which means they cannot use the product at all.
 
-**The domain is verified** (2026-09-16): DKIM and the `send`/`rsend` return-path
-CNAMEs are live, the registrar's locked apex SPF was never touched, and inbound
-forwarding still works. What remains is the switch itself:
+**Done — 2026-09-16.** Production sends as
+`LeadEasyGen <hello@email.leadeasygen.com>`. Note this is the **subdomain**, not
+the apex proposed when this item was written: it isolates sending reputation and
+leaves the registrar's locked apex SPF alone (see
+[EMAIL-SETUP.md](../../../../docs/EMAIL-SETUP.md)).
+
+Confirmed by the ops route's DNS check rather than by a dashboard:
 
 ```
-SMTP_FROM   = LeadEasyGen <hello@leadeasygen.com>
-SMTP_HOST   = smtp.resend.com     SMTP_PORT = 465     SMTP_SECURE = true
-SMTP_USER / SMTP_PASS = Resend credentials
+senderDns  domain: email.leadeasygen.com   ok: true
+  spf    present @send.email.leadeasygen.com      ← the return-path, where SPF applies
+  dmarc  present @leadeasygen.com                 ← inherited from the org domain
+  dkim   present @resend._domainkey.email.leadeasygen.com
 ```
 
-Then redeploy and confirm from the **received message's raw headers** that
-`spf=pass dkim=pass dmarc=pass` — a verified dashboard says the records exist,
-not that a delivered message authenticated.
+Email through: **28 sent, 0 failed**.
+
+Two follow-ups, neither a blocker:
+
+- **`leadeasygen.com` publishes DMARC `p=none`** — a policy that asks receivers
+  to ignore it, so a forged sender is still delivered. Reasonable while `rua`
+  reports are being read; move to `quarantine` once they look clean.
+- **Set `SMTP_DKIM_SELECTORS=resend` and `SMTP_RETURN_PATH_DOMAIN=send.email.leadeasygen.com`
+  in Vercel.** Without them the check cannot tell a provider-owned return-path
+  (correct) from an unauthenticated domain (broken), so it reports the ambiguity
+  instead of a verdict. Both are already set locally.
 
 Full procedure, including the DMARC `v=DMARC1` trap and why Enable Receiving must
 stay off: [CUSTOM-DOMAIN.md](./CUSTOM-DOMAIN.md) Step 7.
