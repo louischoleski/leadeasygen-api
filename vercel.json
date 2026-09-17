@@ -1,6 +1,14 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "crons": [
-    { "path": "/internal/cron/purge", "schedule": "0 4 * * *" }
-  ]
+    {
+      "path": "/internal/cron/purge",
+      "schedule": "0 4 * * *"
+    }
+  ],
+  "functions": {
+    "src/app.ts": {
+      "includeFiles": "{src/db/migrations/sql/**,node_modules/@fonderie/*/dist/migrations/sql/**}"
+    }
+  }
 }
