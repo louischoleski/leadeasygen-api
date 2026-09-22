@@ -271,6 +271,12 @@ export async function configureApp(options: ConfigureAppOptions) {
 					provider: stripeProvider,
 					webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
 					plans: PLANS,
+					// Where this API answers from, basePath included. Only used by
+					// the doctor's webhook-registration check, which compares by
+					// exact URL and must never guess a hostname. Unset ⇒ that check
+					// reports itself skipped — and an endpoint registered at a stale
+					// URL is silent until a payment goes missing.
+					...(process.env.PUBLIC_API_URL ? { publicUrl: process.env.PUBLIC_API_URL } : {}),
 					wallet: {
 						currency: WALLET_CURRENCY,
 						precision: WALLET_PRECISION,
