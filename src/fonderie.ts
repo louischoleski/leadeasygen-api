@@ -4,17 +4,13 @@ import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
 import { explainDrainFailure } from '@fonderie/events';
-import { checkSenderDns, describeSenderDnsProblems, messageStats } from '@fonderie/courier';
+import { messageStats } from '@fonderie/courier';
 import {
 	BillingModule,
 	StripeProvider,
 	SUPPORTED_PAYMENT_OPTIONS,
 	checkPriceConsistency,
-	checkSubscriptionDrift,
-	checkWebhookRegistration,
 	describePriceProblems,
-	describeSubscriptionDrift,
-	describeWebhookProblems,
 	webhookStats,
 } from '@fonderie/billing';
 import type { ResolveRecipient } from '@fonderie/billing';
@@ -33,6 +29,7 @@ import {
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
 import { MIGRATION_STEPS } from './db/migrations/steps.js';
+import { AdminModule, collectChecks, runDoctor } from '@fonderie/admin';
 import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
 import { trialCheckoutGate } from './risk/gate.js';
 
@@ -340,7 +337,89 @@ export async function configureApp(options: ConfigureAppOptions) {
 			new MediaModule(store, { provider: new DbBlobProvider(store) }),
 		);
 
+		// The one check no brick can own: a brick knows its own migrations, not
+		// which sets this deployment applies or in what order. Code goes live
+		// ahead of the schema on every external-migration target, and the
+		// symptom never mentions migrations — so it is asked here.
+		//
+		// Defined once and handed to both consumers: the dashboard's
+		// /_admin/doctor and the cron below. Two copies would drift, and the
+		// operator would be told one thing by the page and another by the log.
+		const migrationsCheck = {
+			name: 'app.migrations',
+			run: async () => {
+				const per = await Promise.all(
+					MIGRATION_STEPS.map(async ([name, path]) => {
+						const files = await new InternalMigrationRunner(store, path).pending();
+						return { name, files };
+					}),
+				);
+				const behind = per.filter((x) => x.files.length > 0);
+				return {
+					ok: behind.length === 0,
+					findings: behind.map(
+						(x) => `${x.name}: ${x.files.length} migration(s) not applied — ${x.files.join(', ')}`,
+					),
+				};
+			},
+		};
+
+		// The operator's surface. Every brick DESCRIBES its admin routes and
+		// checks; this module composes them behind one token at /_admin, logs
+		// every request (including refused ones), and can mint scoped tokens so
+		// a dashboard never holds the root. Unset ADMIN_TOKEN ⇒ no surface at
+		// all (404), which is what preview deployments get.
+		//
+		// `env` is presence-only: /_admin/config reports whether each name is
+		// set, never its value. Bricks never read process.env — config is
+		// injected — so only this file can say which names matter.
+		fonderieApp = fonderieApp.register(
+			new AdminModule({
+				...(process.env.ADMIN_TOKEN ? { adminToken: process.env.ADMIN_TOKEN } : {}),
+				store,
+				// Serve the dashboard at /_admin/ui. This app has no operator
+				// frontend of its own — luna-app is the customer's — so without
+				// this the surface is JSON only and the visibility it exists to
+				// give would need curl.
+				ui: true,
+				// Answer only for the hostnames named here. Vercel routes every
+				// alias and every preview URL to the same instance, so the surface
+				// is otherwise reachable at addresses nobody thinks of as the API.
+				// Unset ⇒ any host, which is the right default for local work.
+				...(process.env.ADMIN_HOST
+					? {
+							host: process.env.ADMIN_HOST.split(',')
+								.map((x) => x.trim())
+								.filter(Boolean),
+						}
+					: {}),
+				env: [
+					'DATABASE_URL',
+					'JWT_SECRET',
+					'STRIPE_SECRET_KEY',
+					'STRIPE_WEBHOOK_SECRET',
+					'STRIPE_WALLET_WEBHOOK_SECRET',
+					'SMTP_HOST',
+					'SMTP_USER',
+					'SMTP_PASS',
+					'SMTP_FROM',
+					'PUBLIC_API_URL',
+					'FRONTEND_URL',
+					'CRON_SECRET',
+					'RISK_PEPPER',
+					'ADMIN_TOKEN',
+					'ADMIN_HOST',
+				],
+				checks: [migrationsCheck],
+			}),
+		);
+
 		const fonderie = await fonderieApp.boot();
+
+		// The same checks the /_admin/doctor page serves, for the cron below to
+		// run and LOG. collectChecks reads every registered module's description,
+		// so a brick added later is covered without touching this file.
+		const adminChecks = collectChecks(fonderie, [migrationsCheck]);
 
 		// The catalog declares a price AND Stripe holds one, and which of the two
 		// the customer actually pays depends on the purchase path: hosted checkout
@@ -498,237 +577,43 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// block used to hand-write SQL against other packages' schemas —
 				// which is exactly how a wrong column name once shipped and threw
 				// on every real database.
-				const [dead, pending, email] = await Promise.all([
-					transport.deadLetters(10),
-					transport.pendingByConsumer(),
+				// The five reconciliation checks, the outbox and the schema used to be
+				// hand-wired here — 200 lines of them, reporting into console.error and
+				// reachable only by curling this route. Every one of them is now
+				// DESCRIBED by the brick that owns it (@fonderie/billing, courier,
+				// events) or supplied by this app (migrations), and @fonderie/admin
+				// serves them at GET /_admin/doctor with the same code this runs.
+				//
+				// The doctor is on demand; the cron is what ALERTS. So run the same
+				// checks here and log what they find — a check nobody reads is not a
+				// check. Report, do not repair: nothing below corrects anything.
+				const report = await runDoctor(adminChecks, 20_000);
+				for (const c of report.checks) {
+					if (c.skipped) continue;
+					for (const line of c.findings) {
+						// A finding on a PASSING check is advice (a p=none DMARC policy, an
+						// endpoint on another API version); only !ok is a hard failure.
+						console[c.ok ? 'warn' : 'error'](`[doctor] ${c.name}: ${line}`);
+					}
+				}
+
+				// Instruments, not checks: numbers with no pass/fail, kept because the
+				// cron's log line is where this deployment watches them.
+				const [email, billing] = await Promise.all([
 					messageStats(store, { hours: 24 }).catch((err) => ({
 						error: err instanceof Error ? err.message : String(err),
 					})),
+					webhookStats(store, { hours: 24 }).catch((err) => ({
+						error: err instanceof Error ? err.message : String(err),
+					})),
 				]);
-				if (dead.length > 0) {
-					console.error(
-						`[queue] ${dead.length} dead notification(s) — these will NEVER be delivered:`,
-						dead.map((d) => `${d.type} (${d.consumer}): ${d.lastError ?? 'no error recorded'}`),
-					);
-				}
-
-				// The same question, asked of money.
-				//
-				// A stale STRIPE_WEBHOOK_SECRET is the worst kind of outage: Stripe
-				// charges the card and reports success, our endpoint rejects the
-				// signature with a 400 that only exists in a log, and the customer
-				// is left paid-up with nothing credited. Nothing in the product
-				// looks wrong until someone complains.
-				//
-				// These two timestamps are what a webhook actually MOVES, so they
-				// answer it without Stripe API access: provider_event_at advances
-				// only when a subscription webhook is accepted, and a purchase row
-				// is written only when a payment webhook credits the wallet. After
-				// re-pointing an endpoint or rotating a secret, send a test event
-				// and watch them move.
-				// Billing owns these tables, so billing answers the question. This
-				// block used to hand-write SQL against fonderie_subscriptions and
-				// fonderie_wallet_ledger.
-				const billing = await webhookStats(store, { hours: 24 }).catch((err) => ({
-					error: err instanceof Error ? err.message : String(err),
-				}));
-
-				// The stats above can only report on events that ARRIVED. They are
-				// blind to the opposite failure: an event we handle that Stripe was
-				// never told to send. That one produces no delivery, no error and no
-				// log line — dunning simply stops happening — and from in here "no
-				// invoice.payment_failed yet" is indistinguishable from "it will never
-				// come". The only way to tell them apart is to ask Stripe what it was
-				// configured to send, which is what this does.
-				//
-				// Requires PUBLIC_API_URL because the comparison is by URL, and it has
-				// to be the exact URL registered in the Stripe dashboard. Deliberately
-				// NOT inferred from VERCEL_URL: that is the per-deployment hostname,
-				// so it would never match the registered endpoint and would report
-				// every event missing on every run. A check that cries wolf is worse
-				// than no check — it trains you to ignore it — so when the URL is
-				// absent we say "not configured" instead of guessing.
-				const publicApiUrl = process.env.PUBLIC_API_URL?.replace(/\/+$/, '');
-				const registration = publicApiUrl
-					? await checkWebhookRegistration(stripeProvider, {
-							subscriptionUrl: `${publicApiUrl}/billing/webhook`,
-							paymentUrl: `${publicApiUrl}/billing/webhook/payment`,
-						}).catch((err) => ({
-							error: err instanceof Error ? err.message : String(err),
-							endpoints: [],
-							ok: false,
-						}))
-					: { skipped: 'PUBLIC_API_URL is not set', endpoints: [], ok: true };
-
-				// Deployed code routinely goes live AHEAD of its migrations, because
-				// they run out of band (npm run migrate, once per deploy, against the
-				// direct connection). Nothing fails at deploy time — the gap only
-				// surfaces when some request happens to touch the new column, and the
-				// symptom looks nothing like the cause: a queue that will not drain, a
-				// callback that hangs, a health route that 500s. Each gets diagnosed
-				// separately, none of them mentions migrations.
-				//
-				// MigrationRunner.pending() answers it directly and read-only. It has
-				// existed for exactly this since the runner was written; nothing had
-				// ever called it.
-				type MigrationState =
-					| { name: string; pending: number; files: string[] }
-					| { name: string; error: string; code?: string };
-				let migrations: MigrationState[] | { unavailable: string } = await Promise.all(
-					MIGRATION_STEPS.map(async ([name, path]): Promise<MigrationState> => {
-						try {
-							const files = await new InternalMigrationRunner(store, path).pending();
-							return { name, pending: files.length, files };
-						} catch (err) {
-							// One unreadable set must not blind the report to the others.
-							const code = (err as { code?: string } | null)?.code;
-							return {
-								name,
-								error: err instanceof Error ? err.message : String(err),
-								...(code ? { code } : {}),
-							};
-						}
-					}),
-				);
-
-				// EVERY set failing to even open its directory is one environment
-				// problem, not eight migration problems. Reporting it eight times
-				// buries the distinction and reads like the schema is on fire.
-				//
-				// The cause is specific and worth naming: .sql files are read with
-				// readdir() at runtime, so the serverless bundler cannot see them and
-				// prunes them — the check then cannot tell "up to date" from "cannot
-				// look", which is worse than not running it at all.
-				if (
-					Array.isArray(migrations) &&
-					migrations.length > 0 &&
-					migrations.every((m) => 'code' in m && m.code === 'ENOENT')
-				) {
-					migrations = {
-						unavailable:
-							'migration .sql files are not present in this deployment bundle, so pending ' +
-							'migrations cannot be counted here. They are read with readdir() at runtime, ' +
-							'which the bundler cannot trace — see vercel.json `functions.includeFiles`.',
-					};
-					console.error('[store] migration check unavailable:', migrations.unavailable);
-				}
-				for (const m of Array.isArray(migrations) ? migrations : []) {
-					if (!('pending' in m) || m.pending === 0) continue;
-					console.error(
-						`[store] ${m.name}: ${m.pending} migration(s) NOT applied — code is live ahead ` +
-							`of the schema: ${m.files.join(', ')}. ` +
-							'Run `npm run migrate` against the direct connection.',
-					);
-				}
-
-				// And the same question asked of our own subscription mirror.
-				// fonderie_subscriptions is fed entirely by webhooks, so a delivery
-				// window we miss leaves it permanently wrong with nothing able to
-				// notice — an active row for a subscription Stripe cancelled (we give
-				// the product away) or a cancelled row for one Stripe still bills (a
-				// paying customer is locked out). Both are invisible from in here,
-				// because a stale mirror and a correct one look identical.
-				const subscriptions = process.env.STRIPE_SECRET_KEY
-					? await checkSubscriptionDrift(stripeProvider, store).catch((err) => ({
-							error: err instanceof Error ? err.message : String(err),
-							checked: 0,
-							drifted: [],
-							ok: false,
-						}))
-					: { skipped: 'STRIPE_SECRET_KEY is not set', checked: 0, drifted: [], ok: true };
-
-				for (const line of describeSubscriptionDrift(subscriptions)) {
-					console.error('[billing] subscription drift:', line);
-				}
-
-				// The same question again, asked of the domain we send mail AS. SPF,
-				// DKIM and DMARC live in public DNS owned by the registrar; courier
-				// only declares a `from`. A mismatch is not a send failure — the
-				// provider accepts the message and the RECEIVER drops or spam-files
-				// it, so there is no bounce and nothing to read in a log. It reaches
-				// us as "I never got the email", weeks later.
-				//
-				// SMTP_DKIM_SELECTORS and SMTP_RETURN_PATH_DOMAIN are optional but
-				// worth setting: without the selectors the check cannot tell a
-				// provider-owned Return-Path (correct) from an unauthenticated domain
-				// (broken), and it says so rather than guessing.
-				const senderFrom = process.env.SMTP_FROM ?? process.env.SMTP_USER;
-				const senderDns = senderFrom
-					? await checkSenderDns(senderFrom, {
-							...(process.env.SMTP_DKIM_SELECTORS
-								? {
-										dkimSelectors: process.env.SMTP_DKIM_SELECTORS.split(',')
-											.map((x) => x.trim())
-											.filter(Boolean),
-									}
-								: {}),
-							...(process.env.SMTP_RETURN_PATH_DOMAIN
-								? { returnPathDomain: process.env.SMTP_RETURN_PATH_DOMAIN }
-								: {}),
-						}).catch((err) => ({
-							error: err instanceof Error ? err.message : String(err),
-							records: [],
-							ok: false,
-						}))
-					: { skipped: 'no SMTP_FROM / SMTP_USER configured', records: [], ok: true };
-
-				for (const line of describeSenderDnsProblems(senderDns)) {
-					console.error('[courier] sender dns:', line);
-				}
-
-				// Same question as registration, asked of prices instead of events:
-				// does what we declare match what the provider holds? The boot check
-				// above only fires on a cold start, which on serverless is easy to
-				// miss entirely — so it is also reported here, where the queue and
-				// registration state already get read.
-				const prices = process.env.STRIPE_SECRET_KEY
-					? await checkPriceConsistency(stripeProvider, {
-							plans: PLANS,
-							wallet: { creditPacks: CREDIT_PACKS },
-						}).catch((err) => ({
-							error: err instanceof Error ? err.message : String(err),
-							entries: [],
-							ok: false,
-						}))
-					: { skipped: 'STRIPE_SECRET_KEY is not set', entries: [], ok: true };
-
-				for (const line of describePriceProblems(prices)) {
-					console.error('[billing] price mismatch:', line);
-				}
-
-				// Loud in the log as well as in the response: a cron that only ever
-				// gets read when someone goes looking is not an alarm.
-				//
-				// Read through describeWebhookProblems rather than `registration.ok`,
-				// because the two are no longer the same question. `ok` answers "will
-				// the events arrive"; an endpoint registered at a DIFFERENT API version
-				// than the client pins still delivers, but the payload is shaped
-				// differently — which is how invoice webhooks went quiet without a
-				// single failed delivery. That one has to be reported even though
-				// `ok` is true.
-				for (const line of describeWebhookProblems(registration)) {
-					console.error('[billing] webhook:', line);
-				}
 
 				return res.json({
-					ok: true,
-					billing,
-					registration,
-					prices,
-					migrations,
-					senderDns,
-					subscriptions,
+					ok: report.ok,
+					doctor: report,
 					email,
-					queue: {
-						dead: dead.length,
-						pending: {
-							total: pending.reduce((n, r) => n + r.waiting, 0),
-							byConsumer: Object.fromEntries(
-								pending.map((r) => [r.consumer, { waiting: r.waiting, oldestMinutes: r.oldestMinutes }]),
-							),
-						},
-						...(drainError ? { drainError } : {}),
-					},
+					billing,
+					...(drainError ? { drainError } : {}),
 				});
 			} catch (err) {
 				console.error('cron purge failed:', err);

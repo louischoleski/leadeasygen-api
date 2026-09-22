@@ -5,6 +5,7 @@ import { getMigrationsPath as billingMigrationsPath } from '@fonderie/billing/mi
 import { getMigrationsPath as mediaMigrationsPath } from '@fonderie/media/migrations';
 import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/migrations';
 import { getMigrationsPath as riskMigrationsPath } from '@fonderie/risk/migrations';
+import { getMigrationsPath as adminMigrationsPath } from '@fonderie/admin/migrations';
 
 import { getAppMigrationsPath } from './index.js';
 
@@ -25,6 +26,8 @@ export const MIGRATION_STEPS: ReadonlyArray<readonly [name: string, path: string
 	['events', eventsMigrationsPath()],
 	['app', getAppMigrationsPath()],
 	['risk', riskMigrationsPath()],
+	// The admin surface's own tables: the request log and the scoped tokens.
+	['admin', adminMigrationsPath()],
 	['courier', courierMigrationsPath()],
 	['billing', billingMigrationsPath()],
 	['storage', storageMigrationsPath()],

@@ -112,6 +112,16 @@ export function buildCourierModule(store: IStoreAdapter, bus: EventBus): Courier
 				// another way. Point them at the apex address, which Namecheap
 				// forwarding actually delivers.
 				...(process.env.SMTP_REPLY_TO ? { replyTo: process.env.SMTP_REPLY_TO } : {}),
+				// What DNS cannot tell the doctor's sender check: a DKIM selector is
+				// not discoverable, and SPF checks the ENVELOPE domain, not the From.
+				// Previously passed by hand at the cron route; now the brick's own
+				// courier.sender-dns check reads them from here.
+				senderDns: {
+					...(process.env.SMTP_DKIM_SELECTORS
+						? { dkimSelectors: process.env.SMTP_DKIM_SELECTORS.split(',').map((x) => x.trim()).filter(Boolean) }
+						: {}),
+					...(process.env.SMTP_RETURN_PATH_DOMAIN ? { returnPathDomain: process.env.SMTP_RETURN_PATH_DOMAIN } : {}),
+				},
 				smtp: {
 					host: process.env.SMTP_HOST!,
 					port: Number(process.env.SMTP_PORT ?? 587),
