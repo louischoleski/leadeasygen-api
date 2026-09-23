@@ -52,6 +52,11 @@ jobs:
     name: Migration safety (production)
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    # DATABASE_URL lives on the Production ENVIRONMENT, and an environment's
+    # secrets are invisible to a job that does not declare it — the job sees
+    # repo-level secrets only and the value resolves to empty. That is not an
+    # error anywhere: it silently took the skip branch.
+    environment: Production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
