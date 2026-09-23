@@ -38,6 +38,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Does anything waiting to be applied to PRODUCTION delete data? Additive
+  # migrations are safe to apply from a pipeline; a DROP is not — the rows are
+  # gone and no down-migration brings them back, so an empty table recreated by
+  # a rollback is not a rollback. This fails the run, making the deletion a
+  # decision someone makes rather than something a deploy did.
+  #
+  # Skips when MIGRATE_DATABASE_URL is unset, so a fork is not red for missing a
+  # secret. Set it to the SESSION or DIRECT Postgres url, never the transaction
+  # pooler — a pooler lends a backend per transaction.
+  migration-safety:
+    name: Migration safety (production)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Check for destructive pending migrations
+        env:
+          DATABASE_URL: ${{ secrets.MIGRATE_DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "MIGRATE_DATABASE_URL not set — skipping the production check."
+            exit 0
+          fi
+          npm run migrate:check
+
   api-e2e:
     name: API e2e (MFA)
     runs-on: ubuntu-latest
