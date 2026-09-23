@@ -44,9 +44,10 @@ jobs:
   # a rollback is not a rollback. This fails the run, making the deletion a
   # decision someone makes rather than something a deploy did.
   #
-  # Skips when MIGRATE_DATABASE_URL is unset, so a fork is not red for missing a
-  # secret. Set it to the SESSION or DIRECT Postgres url, never the transaction
-  # pooler — a pooler lends a backend per transaction.
+  # Skips when DATABASE_URL is unset, so a fork is not red for missing a secret.
+  # Any connection mode works: migrate:check only READS which migrations are
+  # applied. The session/direct requirement belongs to whatever APPLIES them,
+  # which is not this job.
   migration-safety:
     name: Migration safety (production)
     runs-on: ubuntu-latest
@@ -60,10 +61,10 @@ jobs:
       - run: npm ci
       - name: Check for destructive pending migrations
         env:
-          DATABASE_URL: ${{ secrets.MIGRATE_DATABASE_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
-            echo "MIGRATE_DATABASE_URL not set — skipping the production check."
+            echo "DATABASE_URL secret not set — skipping the production check."
             exit 0
           fi
           npm run migrate:check
