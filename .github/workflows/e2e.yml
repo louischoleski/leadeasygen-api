@@ -121,14 +121,36 @@ jobs:
           fi
           npm run migrate
       # Proves it, rather than trusting the exit code of the thing that just
-      # ran. migrate:check exits non-zero only on destructive pending work, so
-      # read the output: "up to date" is the claim being verified.
+      # ran.
+      #
+      # This step was `npm run migrate:check` alone and it PASSED with four
+      # migrations still unapplied — migrate:check exits non-zero only on
+      # DESTRUCTIVE pending work, never on pending-at-all, so a step named
+      # "confirm nothing is left pending" confirmed nothing of the sort. It
+      # found the real bug (rate-limit's migrations were absent from
+      # MIGRATION_STEPS) and then reported success about it.
+      #
+      # So assert the COUNT, from the output, and fail on any remainder.
       - name: Confirm nothing is left pending
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           if [ -z "$DATABASE_URL" ]; then exit 0; fi
-          npm run migrate:check
+          out=$(npm run --silent migrate:check)
+          echo "$out"
+          # "N pending, M destructive." — anything but 0 pending means the
+          # applier and the checker disagree about what this app owns, which
+          # is the condition that hid a missing table for weeks.
+          if echo "$out" | grep -qE '^[1-9][0-9]* pending'; then
+            echo ""
+            echo "Migrations remain pending AFTER a successful apply."
+            echo "npm run migrate walks MIGRATION_STEPS; migrate:check scans"
+            echo "node_modules. A set the checker sees and the applier does not"
+            echo "is either missing from MIGRATION_STEPS (a real gap — the table"
+            echo "will never exist) or an installed package this app does not"
+            echo "use (noise). Resolve which; do not leave them disagreeing."
+            exit 1
+          fi
 
   api-e2e:
     name: API e2e (MFA)
