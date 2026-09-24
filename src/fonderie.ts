@@ -417,6 +417,14 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'ADMIN_HOST',
 				],
 				checks: [migrationsCheck],
+				// The SAME constant migrate.ts applies, so the panel can never
+				// offer an order the applier would not run — and the reporter
+				// above and the applier here cannot disagree about what exists.
+				// Reports every module's pending files with their impact, and
+				// applies a module whose pending set is entirely additive;
+				// refuses anything that deletes data, and anything sitting
+				// behind a module that is itself behind.
+				migrations: MIGRATION_STEPS,
 			}),
 		);
 
