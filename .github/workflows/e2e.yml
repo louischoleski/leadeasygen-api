@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets the production migration check and apply be run on demand, without a
+  # push and without repo-admin rights. Re-running someone else's run needs
+  # admin; dispatching a workflow does not.
+  workflow_dispatch:
 
 jobs:
   lint-typecheck:
@@ -72,6 +76,58 @@ jobs:
             echo "DATABASE_URL secret not set — skipping the production check."
             exit 0
           fi
+          npm run migrate:check
+
+  # Applies what the check above cleared. Split from it deliberately: that job
+  # decides, this one acts, and `needs` makes the decision a precondition —
+  # a destructive migration exits the check non-zero and this never starts.
+  #
+  # This is the "one instance" argument for putting it in CI at all. The
+  # alternative was migrating at boot, where every serverless cold start
+  # re-runs them on the request path and concurrent instances race. One runner,
+  # once per push. (The runner is safe under concurrency regardless —
+  # pg_advisory_xact_lock plus an in-lock recheck — but a single applier means
+  # never having to rely on that.)
+  #
+  # NOT a deploy gate. Vercel deploys on push independently, so new code can be
+  # live for the ~minute this takes. Additive migrations make that survivable:
+  # the new column simply is not there yet. It is the reason destructive ones
+  # are refused rather than sequenced.
+  migrate:
+    name: Apply migrations (production)
+    runs-on: ubuntu-latest
+    needs: migration-safety
+    if: github.ref == 'refs/heads/main'
+    environment: Production
+    # Two pushes in quick succession must not both apply. Queue rather than
+    # cancel: a half-finished migration run is worse than a late one.
+    concurrency:
+      group: migrate-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Apply pending migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL secret not set — nothing to migrate against."
+            exit 0
+          fi
+          npm run migrate
+      # Proves it, rather than trusting the exit code of the thing that just
+      # ran. migrate:check exits non-zero only on destructive pending work, so
+      # read the output: "up to date" is the claim being verified.
+      - name: Confirm nothing is left pending
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then exit 0; fi
           npm run migrate:check
 
   api-e2e:
