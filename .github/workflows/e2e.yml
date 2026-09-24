@@ -138,17 +138,32 @@ jobs:
           if [ -z "$DATABASE_URL" ]; then exit 0; fi
           out=$(npm run --silent migrate:check)
           echo "$out"
-          # "N pending, M destructive." — anything but 0 pending means the
-          # applier and the checker disagree about what this app owns, which
-          # is the condition that hid a missing table for weeks.
-          if echo "$out" | grep -qE '^[1-9][0-9]* pending'; then
+          # Per MODULE, not the total. migrate:check discovers by scanning
+          # node_modules; npm run migrate walks MIGRATION_STEPS. They can
+          # legitimately differ — an installed package this app never mounts
+          # has migrations it does not need. Each such module is named here
+          # WITH its reason, the same convention the fonderie gates use, so
+          # the exception is a decision rather than a silence.
+          #
+          # workspaces: a direct dependency only because @fonderie/adapter-express
+          # peers it. Nothing in src/ mounts WorkspacesModule, so its three
+          # tables are not used. Delete this line the day that changes.
+          UNUSED='workspaces'
+          left=$(echo "$out" | grep -oE '^[a-z-]+: [0-9]+ pending' | cut -d: -f1 \
+                 | grep -vxF "$UNUSED" || true)
+          if [ -n "$left" ]; then
             echo ""
-            echo "Migrations remain pending AFTER a successful apply."
+            echo "Migrations remain pending AFTER a successful apply:"
+            echo "$left" | sed 's/^/  - /'
+            echo ""
             echo "npm run migrate walks MIGRATION_STEPS; migrate:check scans"
-            echo "node_modules. A set the checker sees and the applier does not"
-            echo "is either missing from MIGRATION_STEPS (a real gap — the table"
-            echo "will never exist) or an installed package this app does not"
-            echo "use (noise). Resolve which; do not leave them disagreeing."
+            echo "node_modules. A module the checker sees and the applier does"
+            echo "not is either missing from MIGRATION_STEPS — a real gap, the"
+            echo "table will never exist — or an installed package this app does"
+            echo "not use, which belongs in UNUSED above with its reason."
+            echo ""
+            echo "rate-limit sat in the first category while the checkout"
+            echo "limiter failed open against a table that was never created."
             exit 1
           fi
 
