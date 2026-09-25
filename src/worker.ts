@@ -72,9 +72,15 @@ async function main() {
 	// Polls rather than LISTENs, so it needs no special connection: the same
 	// DATABASE_URL the API publishes with is enough.
 	let notifyBus: EventBus | null = null;
+	// Held, not discarded. @fonderie/core 0.21.0 gives every module an optional
+	// stop(), and app.shutdown() calls them in reverse install order — so a brick
+	// registered here later releases its resources without anyone remembering to
+	// add it to the teardown below. Stopping only what we happen to remember is
+	// how a Cloud Run job ends up paying for a pool nobody closed.
+	let notifyApp: FonderieApp | null = null;
 	if (emailConfigured()) {
 		const { module: notifications } = createNotifyBus(databaseUrl, { consume: false });
-		await new FonderieApp(defineConfig({ db: { url: databaseUrl } }))
+		notifyApp = await new FonderieApp(defineConfig({ db: { url: databaseUrl } }))
 			.register(notifications)
 			.register(buildCourierModule(store, notifications.bus))
 			.boot();
@@ -258,6 +264,12 @@ async function main() {
 
 		try {
 			clearInterval(timer);
+			// Registered modules first: this releases anything a brick owns that
+			// this file does not know about. EventsModule.stop() takes the
+			// notification bus down with it, so the loop below is left to cover
+			// the scrape bus, which belongs to no app. Both are idempotent —
+			// stopping the notification bus twice is a no-op, not an error.
+			await notifyApp?.shutdown();
 			for (const b of buses) await b.stop();
 			await store.end();
 		} catch (err) {
