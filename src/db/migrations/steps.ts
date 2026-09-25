@@ -7,6 +7,7 @@ import { getMigrationsPath as storageMigrationsPath } from '@fonderie/storage/mi
 import { getMigrationsPath as riskMigrationsPath } from '@fonderie/risk/migrations';
 import { getMigrationsPath as adminMigrationsPath } from '@fonderie/admin/migrations';
 import { getMigrationsPath as rateLimitMigrationsPath } from '@fonderie/rate-limit/migrations';
+import { getMigrationsPath as configMigrationsPath } from '@fonderie/config/migrations';
 
 import { getAppMigrationsPath } from './index.js';
 
@@ -32,6 +33,11 @@ import { getAppMigrationsPath } from './index.js';
 export const MIGRATION_STEPS: ReadonlyArray<readonly [name: string, path: string]> = [
 	// No foreign keys of its own, so it can go first.
 	['rate-limit', rateLimitMigrationsPath()],
+	// Also standalone: fonderie_config, its revisions, and fonderie_secrets.
+	// Ordered early because the config manager reads its table during boot —
+	// before any route is served — so a deploy that ships this code ahead of the
+	// schema fails at startup rather than on first request.
+	['config', configMigrationsPath()],
 	['auth', authMigrationsPath()],
 	['events', eventsMigrationsPath()],
 	['app', getAppMigrationsPath()],
