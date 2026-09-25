@@ -30,6 +30,7 @@ import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
 import { MIGRATION_STEPS } from './db/migrations/steps.js';
 import { AdminModule, collectChecks, runDoctor } from '@fonderie/admin';
+import { ConfigModule, createAesGcmEncryptor } from '@fonderie/config';
 import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
 import { trialCheckoutGate } from './risk/gate.js';
 
@@ -342,6 +343,51 @@ export async function configureApp(options: ConfigureAppOptions) {
 		fonderieApp = fonderieApp.register(
 			new MediaModule(store, { provider: new DbBlobProvider(store) }),
 		);
+
+		// Runtime configuration and secrets, editable from the console instead of
+		// through a redeploy. Until @fonderie/admin 1.0.0 this could not be
+		// registered at all: both modules described GET /_admin/config and boot
+		// failed outright, in either order. That report is now /_admin/environment
+		// and the name belongs to this brick.
+		//
+		// NO adminToken ON PURPOSE. Setting one makes this brick register its own
+		// `/admin/config/*` and `/admin/secrets/*` routes, guarded by a SECOND
+		// token — a whole extra admin surface on a path nobody is watching.
+		// describeAdmin() is unconditional, so leaving it unset still gives the
+		// console the same routes under `/_admin`, behind the admin brick's token
+		// and its read/write/secrets scopes. One surface, one token, one guard.
+		//
+		// The encryptor is NOT optional here, whatever the brick's readiness check
+		// says. That check treats secrets as exposed only when this brick has its
+		// own adminToken — but the console reveals them through
+		// /_admin/secrets/:key/reveal regardless, so without a key they would sit
+		// in Postgres as plaintext and be readable over the API. Unset ⇒ we do not
+		// register the brick at all, rather than quietly storing secrets in clear.
+		const configKey = process.env.CONFIG_SECRET_KEY;
+		if (configKey && !/^[0-9a-fA-F]{64}$/.test(configKey)) {
+			// createAesGcmEncryptor throws on a bad key, and it is called during
+			// setup — so a malformed value takes the WHOLE API down at boot, auth
+			// and billing included, with a message that names neither this
+			// variable nor the fix. `openssl rand -base64 32` is the natural
+			// mistake and produces exactly this: right entropy, wrong encoding.
+			throw new Error(
+				`CONFIG_SECRET_KEY must be 64 hex characters (32 bytes); got ${configKey.length} ` +
+					`character(s)${/^[0-9a-fA-F]+$/.test(configKey) ? '' : ' containing non-hex'}. ` +
+					'Generate it with `openssl rand -hex 32` — NOT -base64.',
+			);
+		}
+		if (configKey) {
+			fonderieApp = fonderieApp.register(
+				new ConfigModule(store, {
+					secretEncryptor: createAesGcmEncryptor(configKey),
+					// LISTEN-based invalidation needs a dedicated connection, which a
+					// transaction-mode pooler refuses. Vercel gives us the pooler, so
+					// the TTL poll is the only refresh path here — deliberately, not
+					// by omission.
+					environment: process.env.NODE_ENV ?? 'development',
+				}),
+			);
+		}
 
 		// The one check no brick can own: a brick knows its own migrations, not
 		// which sets this deployment applies or in what order. Code goes live
