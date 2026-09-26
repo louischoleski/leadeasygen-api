@@ -19,14 +19,23 @@ import type { ExpressRequest, ExpressResponse } from '@fonderie/adapter-express'
 import type { StripeProvider } from '@fonderie/billing';
 import type { IStoreAdapter } from '@fonderie/store/types';
 import type { Identifier, RiskEngine } from '@fonderie/risk';
+import { geoFromHeaders, type GeoHeaderSource } from '@fonderie/geo';
 
 import type { AuthedUser } from '../auth/requireAuth.js';
 import { PLANS } from '../billing/catalog.js';
+import { isOutsideMarket } from './market.js';
 
 interface TrialGateDeps {
 	store: IStoreAdapter;
 	provider: StripeProvider;
 	risk: RiskEngine;
+	/**
+	 * Where the requester is (@fonderie/geo). `trust` names the platform whose
+	 * edge headers to believe — from the deployment env, never the request;
+	 * undefined off-platform. `marketCountries` is the set of ISO-3166-1 codes a
+	 * FREE TRIAL is offered in; null = everywhere. Paid checkout is never gated.
+	 */
+	geo?: { trust: GeoHeaderSource | undefined; marketCountries: ReadonlySet<string> | null };
 }
 
 // Billing's live-subscription set: a subscriber in any of these gets an in-place
@@ -153,6 +162,15 @@ export function trialCheckoutGate(deps: TrialGateDeps) {
 			const domain = emailDomain(user.email);
 			const device = deviceFingerprint(req);
 			const ip = clientIp(req);
+			// Country is decision-grade; region/city are display-grade and unused
+			// here. Unknown (off-platform, header missing or malformed) is NOT
+			// suspicious: outsideMarket fires only on a KNOWN country outside the
+			// configured market, and only when a market is configured at all.
+			const loc = deps.geo?.trust
+				? geoFromHeaders(req.headers as Record<string, string | string[] | undefined>, { trust: deps.geo.trust })
+				: null;
+			const country = loc?.country ?? null;
+			const outsideMarket = isOutsideMarket(country, deps.geo?.marketCountries ?? null);
 			const card = await cardFingerprint(deps, user.id);
 			const identifiers: Identifier[] = [];
 			if (card) identifiers.push({ kind: 'card', value: card });
@@ -166,6 +184,8 @@ export function trialCheckoutGate(deps: TrialGateDeps) {
 				attributes: {
 					disposableEmail: isDisposable(domain),
 					accountAgeMinutes: (Date.now() - new Date(user.createdAt).getTime()) / 60_000,
+					...(country ? { country } : {}),
+					outsideMarket,
 				},
 			});
 

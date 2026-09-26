@@ -82,6 +82,10 @@ Values that are **not** just copied from `.env`:
   `openssl rand -hex 32`. Never reuse the dev values. `RISK_PEPPER` is
   mandatory: the risk engine **fails the boot** in production without a
   unique, non-placeholder pepper.
+- `TRIAL_MARKET_COUNTRIES` — optional, e.g. `CA,US`: where a **free trial** is
+  offered. Country comes from Vercel's edge geolocation headers (via
+  `@fonderie/geo`, trusted only on Vercel); a known country outside the list
+  gets "no free trial" on checkout, paid stays open. Unset = everywhere.
 - `CONFIG_SECRET_KEY` — **exactly 64 hex characters** (`openssl rand -hex 32`,
   not `-base64`): the key `@fonderie/config` encrypts secrets under. Unset ⇒
   the config brick is not registered and `/_admin/config` + `/_admin/secrets`

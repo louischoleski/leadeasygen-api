@@ -31,8 +31,9 @@ import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billin
 import { MIGRATION_STEPS } from './db/migrations/steps.js';
 import { AdminModule, collectChecks, runDoctor } from '@fonderie/admin';
 import { ConfigModule, createAesGcmEncryptor } from '@fonderie/config';
-import { RiskEngine, DEFAULT_RULESETS } from '@fonderie/risk';
+import { RiskEngine, DEFAULT_RULESETS, TRIAL_START_RULESET } from '@fonderie/risk';
 import { trialCheckoutGate } from './risk/gate.js';
+import { parseMarketCountries } from './risk/market.js';
 
 export interface ConfigureAppOptions {
 	/** The Express app to wire. The entry owns it so it can be exported before boot completes. */
@@ -485,6 +486,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'ADMIN_TOKEN',
 					'ADMIN_HOST',
 					'CONFIG_SECRET_KEY',
+					'TRIAL_MARKET_COUNTRIES',
 				],
 				checks: [migrationsCheck],
 				// The SAME constant migrate.ts applies, so the panel can never
@@ -557,11 +559,38 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// in production). Signals/scoring/hashing + the risk_events store that used
 		// to live in src/risk/ now live in the brick.
 		engine = new RiskEngine(store, {
-			rulesets: DEFAULT_RULESETS,
+			rulesets: {
+				...DEFAULT_RULESETS,
+				'trial.start': {
+					...TRIAL_START_RULESET,
+					signals: {
+						...TRIAL_START_RULESET.signals,
+						// A KNOWN country outside TRIAL_MARKET_COUNTRIES: no free trial
+						// (75 > high 70, the same weight as card reuse) — paid checkout
+						// stays open via skipTrial. Never fires when the list is unset or
+						// the country is unknown; the gate computes the boolean.
+						outsideMarket: { weight: 75, attr: 'outsideMarket' },
+					},
+				},
+			},
 			pepper: process.env.RISK_PEPPER,
 		});
 		const riskEngine = engine;
-		const risk = { store, provider: stripeProvider, risk: riskEngine };
+		// ── Where the requester is (@fonderie/geo) ─────────────────────────
+		// On Vercel the edge stamps country/region/city on every request. Trust
+		// comes from the deployment env, never the request (anyone can send
+		// x-vercel-ip-country to a server that is not behind Vercel). Off-platform
+		// → undefined → the gate sees "unknown", which is never suspicious.
+		const geoTrust = process.env.VERCEL ? ('vercel' as const) : undefined;
+		// ISO-3166-1 codes a FREE TRIAL is offered in. Unset = everywhere; a
+		// malformed code fails the boot rather than silently dropping the rule.
+		const marketCountries = parseMarketCountries(process.env.TRIAL_MARKET_COUNTRIES);
+		const risk = {
+			store,
+			provider: stripeProvider,
+			risk: riskEngine,
+			geo: { trust: geoTrust, marketCountries },
+		};
 		// The real gate, at the moment billing would grant
 		// plan.trialDays. Auth first (an unauthenticated flood must cost 401s,
 		// not rate-limit tokens), then a PER-USER velocity brake (per-IP would
