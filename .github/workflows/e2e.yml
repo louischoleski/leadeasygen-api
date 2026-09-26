@@ -148,7 +148,14 @@ jobs:
           # workspaces: a direct dependency only because @fonderie/adapter-express
           # peers it. Nothing in src/ mounts WorkspacesModule, so its three
           # tables are not used. Delete this line the day that changes.
-          UNUSED='workspaces'
+          #
+          # geo: used through geoFromHeaders() — the platform's edge headers,
+          # no table. Its PostgresGeoProvider migration (001_geo.sql) is the
+          # self-hosted path this app deliberately does not take. If a lookup
+          # by IP is ever wired, add ['geo', geoMigrationsPath()] to
+          # MIGRATION_STEPS and delete this line.
+          UNUSED='workspaces
+          geo'
           left=$(echo "$out" | grep -oE '^[a-z-]+: [0-9]+ pending' | cut -d: -f1 \
                  | grep -vxF "$UNUSED" || true)
           if [ -n "$left" ]; then
