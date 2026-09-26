@@ -66,7 +66,7 @@ npx vercel link            # create/pick the project
 Set the environment variables (each prompts for a value):
 
 ```bash
-for k in DATABASE_URL JWT_SECRET RISK_PEPPER CRON_SECRET FRONTEND_URL \
+for k in DATABASE_URL JWT_SECRET RISK_PEPPER CRON_SECRET CONFIG_SECRET_KEY FRONTEND_URL \
          STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET STRIPE_WALLET_WEBHOOK_SECRET \
          STRIPE_PRICE_SMALL STRIPE_PRICE_MEDIUM STRIPE_PRICE_LARGE \
          STRIPE_PRICE_UNLIMITED_MONTHLY STRIPE_PRICE_UNLIMITED_YEARLY \
@@ -82,6 +82,11 @@ Values that are **not** just copied from `.env`:
   `openssl rand -hex 32`. Never reuse the dev values. `RISK_PEPPER` is
   mandatory: the risk engine **fails the boot** in production without a
   unique, non-placeholder pepper.
+- `CONFIG_SECRET_KEY` — **exactly 64 hex characters** (`openssl rand -hex 32`,
+  not `-base64`): the key `@fonderie/config` encrypts secrets under. Unset ⇒
+  the config brick is not registered and `/_admin/config` + `/_admin/secrets`
+  do not exist (the boot log says so). Set once per environment; rotating it
+  is `rotateSecretKey()`, not an env edit.
 - `FRONTEND_URL` — the app's public URL. It is both the Stripe return URL and
   the CORS origin, so a wrong value breaks checkout *and* every browser call.
 - `SMTP_*` — required. The boot fails in production without `SMTP_HOST`,

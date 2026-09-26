@@ -235,7 +235,21 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// (Clerk is not a Fonderie brick; @fonderie/auth is the default.)
 		// Registers POST /auth/register, POST /auth/login, POST /auth/refresh,
 		// POST /auth/logout, GET /users (user.me), etc.
-		let fonderieApp = new FonderieApp(defineConfig({ db: { url: databaseUrl } })).register(
+		let fonderieApp = new FonderieApp(
+			defineConfig({
+				db: { url: databaseUrl },
+				// /readyz used to answer {"dependencies":true} as a constant: 200 with
+				// the database down or the schema behind. Now it is the same two
+				// questions the doctor asks — can we reach Postgres, and is every
+				// registered brick's migration list applied. Vercel does not route
+				// on it, so an honest false costs nothing but tells the truth to the
+				// post-deploy probe and to anyone who curls it.
+				readyProbe: async () => {
+					if (!(await store.testConnection())) return false;
+					return (await migrationsCheck.run()).ok;
+				},
+			}),
+		).register(
 			new AuthModule(
 				store,
 				{
@@ -376,6 +390,15 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'Generate it with `openssl rand -hex 32` — NOT -base64.',
 			);
 		}
+		if (!configKey) {
+			// Silence here cost a session: the brick simply did not exist and
+			// nothing said why. Name the variable and the two routes that will
+			// be missing, once, at boot.
+			console.warn(
+				'[leadeasygen] CONFIG_SECRET_KEY is unset — ConfigModule not registered; ' +
+					'/_admin/config and /_admin/secrets will be absent. Generate with `openssl rand -hex 32`.',
+			);
+		}
 		if (configKey) {
 			fonderieApp = fonderieApp.register(
 				new ConfigModule(store, {
@@ -461,6 +484,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'RISK_PEPPER',
 					'ADMIN_TOKEN',
 					'ADMIN_HOST',
+					'CONFIG_SECRET_KEY',
 				],
 				checks: [migrationsCheck],
 				// The SAME constant migrate.ts applies, so the panel can never
