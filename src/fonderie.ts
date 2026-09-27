@@ -465,6 +465,12 @@ export async function configureApp(options: ConfigureAppOptions) {
 		fonderieApp = fonderieApp.register(
 			new AdminModule({
 				...(process.env.ADMIN_TOKEN ? { adminToken: process.env.ADMIN_TOKEN } : {}),
+				// Operators sign in to the console with email + password + an
+				// authenticator app; the root token claims the first one, once.
+				// OPTIONAL hardening: seals their authenticator secrets at rest.
+				// Unset is supported. Once set, keep it — changing it invalidates
+				// every enrolled phone.
+				...(process.env.ADMIN_OPERATOR_KEY ? { operatorKey: process.env.ADMIN_OPERATOR_KEY } : {}),
 				store,
 				// Serve the dashboard at /_admin/ui. This app has no operator
 				// frontend of its own — luna-app is the customer's — so without
