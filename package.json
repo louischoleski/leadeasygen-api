@@ -22,7 +22,7 @@
 	},
 	"dependencies": {
 		"@fonderie/adapter-express": "^5.3.6",
-		"@fonderie/admin": "^1.2.1",
+		"@fonderie/admin": "^1.2.2",
 		"@fonderie/auth": "^7.10.0",
 		"@fonderie/billing": "^10.0.0",
 		"@fonderie/config": "^6.4.0",
