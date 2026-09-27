@@ -417,6 +417,11 @@ export async function configureApp(options: ConfigureAppOptions) {
 					// the TTL poll is the only refresh path here — deliberately, not
 					// by omission.
 					environment: process.env.NODE_ENV ?? 'development',
+					// What the frontend may read (GET /config/public, no auth) —
+					// nothing else in config is exposed. Each key maps to the value
+					// reported while it is unset in /_admin.
+					//   MAINTENANCE_MESSAGE — banner text shown to every user; '' = none
+					publicKeys: { MAINTENANCE_MESSAGE: '' },
 				}),
 			);
 		}
