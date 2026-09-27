@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { FonderieApp, defineConfig, installPlatformBackgroundRunner, isServerlessRuntime } from '@fonderie/core';
 import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
-import { AuthModule } from '@fonderie/auth';
+import { AuthModule, purgeSoftDeletedUsers } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
 import { explainDrainFailure } from '@fonderie/events';
 import { messageStats } from '@fonderie/courier';
@@ -453,6 +453,32 @@ export async function configureApp(options: ConfigureAppOptions) {
 			},
 		};
 
+		// Money that outlived its account. Billing cancels a subscription when
+		// its user is deleted (fonderie.user.deleted, @fonderie/billing ≥ the
+		// deletion release) — but not for accounts deleted before that, and not
+		// if the event failed to deliver. The app is the only place that can join
+		// the two tables, so it asks: is anyone deleted still being billed?
+		const deletedAccountsBillingCheck = {
+			name: 'app.deleted-accounts-billing',
+			run: async () => {
+				const rows = await store.query<{ id: string; status: string; plan: string }>(
+					`SELECT s.subscriber_id AS id, s.status, s.plan
+					   FROM fonderie_subscriptions s
+					   JOIN fonderie_users u ON u.id = s.subscriber_id
+					  WHERE s.subscriber_type = 'user'
+					    AND u.deleted_at IS NOT NULL
+					    AND s.status IN ('active', 'trialing', 'past_due', 'unpaid')
+					    AND NOT s.cancel_at_period_end`,
+				);
+				return {
+					ok: rows.length === 0,
+					findings: rows.map(
+						(r) => `user ${r.id} is deleted but still on '${r.plan}' (${r.status}) — cancel it in Stripe or from the Subscriptions page`,
+					),
+				};
+			},
+		};
+
 		// The operator's surface. Every brick DESCRIBES its admin routes and
 		// checks; this module composes them behind one token at /_admin, logs
 		// every request (including refused ones), and can mint scoped tokens so
@@ -507,7 +533,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'CONFIG_SECRET_KEY',
 					'TRIAL_MARKET_COUNTRIES',
 				],
-				checks: [migrationsCheck],
+				checks: [migrationsCheck, deletedAccountsBillingCheck],
 				// The SAME constant migrate.ts applies, so the panel can never
 				// offer an order the applier would not run — and the reporter
 				// above and the applier here cannot disagree about what exists.
@@ -524,7 +550,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// The same checks the /_admin/doctor page serves, for the cron below to
 		// run and LOG. collectChecks reads every registered module's description,
 		// so a brick added later is covered without touching this file.
-		const adminChecks = collectChecks(fonderie, [migrationsCheck]);
+		const adminChecks = collectChecks(fonderie, [migrationsCheck, deletedAccountsBillingCheck]);
 
 		// The catalog declares a price AND Stripe holds one, and which of the two
 		// the customer actually pays depends on the purchase path: hosted checkout
@@ -667,6 +693,19 @@ export async function configureApp(options: ConfigureAppOptions) {
 					console.error('[auth:google] handoff purge failed:', err),
 				);
 
+				// Right-to-erasure follow-through: accounts soft-deleted more than
+				// USER_RETENTION_DAYS ago are hard-deleted. Each one is announced as
+				// fonderie.user.purged, which billing turns into deleting the Stripe
+				// customer (email + saved cards). The drain just below delivers it.
+				const retentionDays = Number(process.env.USER_RETENTION_DAYS ?? 30);
+				const usersPurged = await purgeSoftDeletedUsers(store, {
+					olderThanDays: Number.isFinite(retentionDays) && retentionDays >= 0 ? retentionDays : 30,
+					bus: notifyBus,
+				}).catch((err) => {
+					console.error('[auth] user retention purge failed:', err);
+					return null;
+				});
+
 				// Drain before reporting, for two reasons: the numbers below then
 				// describe what is genuinely stuck rather than what merely had not
 				// been picked up yet, and this is the backstop for anything the
@@ -743,6 +782,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 				return res.json({
 					ok: report.ok,
 					doctor: report,
+					usersPurged,
 					email,
 					billing,
 					...(drainError ? { drainError } : {}),
