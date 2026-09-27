@@ -19,6 +19,8 @@ import type { IStoreAdapter } from "@fonderie/store/types";
  * proxy's. resolveClientIp applies the same TRUST_PROXY-aware logic the
  * adapters use — never re-derive forwarding rules locally.
  */
+const GEO_HEADER = /^(x-vercel-ip-|cf-ip|cf-region|cf-postal-code|cf-timezone)/;
+
 export function callerContext(req: Request): {
 	headers: Record<string, string>;
 	init: { meta: { clientIp: string } } | undefined;
@@ -33,6 +35,15 @@ export function callerContext(req: Request): {
 	const headers: Record<string, string> = { cookie: req.headers.cookie ?? "" };
 	const ua = req.headers["user-agent"];
 	if (typeof ua === "string" && ua) headers["user-agent"] = ua;
+	// The platform's geolocation headers (x-vercel-ip-country, -region, -city…)
+	// are what auth's `location` resolver reads. Only a named allow-list of
+	// headers is forwarded into the synthetic request, so these must be added
+	// explicitly — without them every Google sign-in recorded no location while
+	// password sign-ins, which keep their headers, did. Values are forwarded
+	// verbatim; geoFromHeaders validates and only trusts them on Vercel.
+	incoming.forEach((value, key) => {
+		if (GEO_HEADER.test(key)) headers[key] = value;
+	});
 
 	return { headers, init: clientIp ? { meta: { clientIp } } : undefined };
 }
