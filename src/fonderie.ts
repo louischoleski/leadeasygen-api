@@ -32,6 +32,7 @@ import { MIGRATION_STEPS } from './db/migrations/steps.js';
 import { AdminModule, collectChecks, runDoctor } from '@fonderie/admin';
 import { ConfigModule, createAesGcmEncryptor } from '@fonderie/config';
 import { RiskEngine, DEFAULT_RULESETS, TRIAL_START_RULESET } from '@fonderie/risk';
+import { geoFromHeaders } from '@fonderie/geo';
 import { trialCheckoutGate } from './risk/gate.js';
 import { parseMarketCountries } from './risk/market.js';
 
@@ -259,6 +260,13 @@ export async function configureApp(options: ConfigureAppOptions) {
 					providers: googleOAuth ? ['email', 'google'] : ['email'],
 					...(googleOAuth ? { google: googleOAuth } : {}),
 					requireVerification: false,
+					// Login history and active sessions show where each sign-in and
+					// sign-up came from. Vercel stamps
+					// country/region/city on every request; trusted only when this
+					// process runs on Vercel (never from the request). Off-platform →
+					// no location, and a login never waits on or fails because of it.
+					location: ({ headers }) =>
+						geoFromHeaders(headers, { trust: process.env.VERCEL ? 'vercel' : undefined }),
 				},
 				notifyBus,
 			),
