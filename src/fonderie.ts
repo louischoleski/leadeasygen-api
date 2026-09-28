@@ -3,7 +3,7 @@ import { FonderieApp, defineConfig, installPlatformBackgroundRunner, isServerles
 import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
 import { AuthModule, purgeSoftDeletedUsers } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
-import { explainDrainFailure } from '@fonderie/events';
+import { explainDrainFailure, purgeEvents } from '@fonderie/events';
 import { messageStats } from '@fonderie/courier';
 import {
 	BillingModule,
@@ -706,6 +706,19 @@ export async function configureApp(options: ConfigureAppOptions) {
 					return null;
 				});
 
+				// The event log is also the audit trail, and it grew forever: nothing
+				// here ever disposed of it. EVENT_RETENTION_DAYS (default 365 — the
+				// usual audit-trail minimum) keeps the last year; delivery rows go
+				// with their event (ON DELETE CASCADE). Disposal, not tampering: whole
+				// aged rows are removed and no kept row's HMAC is touched.
+				const eventDays = Number(process.env.EVENT_RETENTION_DAYS ?? 365);
+				const eventsPurged = await purgeEvents(store, {
+					olderThanDays: Number.isFinite(eventDays) && eventDays >= 0 ? eventDays : 365,
+				}).catch((err) => {
+					console.error('[events] retention purge failed:', err);
+					return null;
+				});
+
 				// Drain before reporting, for two reasons: the numbers below then
 				// describe what is genuinely stuck rather than what merely had not
 				// been picked up yet, and this is the backstop for anything the
@@ -783,6 +796,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					ok: report.ok,
 					doctor: report,
 					usersPurged,
+					eventsPurged,
 					email,
 					billing,
 					...(drainError ? { drainError } : {}),
