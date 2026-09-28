@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { FonderieApp, defineConfig, installPlatformBackgroundRunner, isServerlessRuntime } from '@fonderie/core';
-import { InternalMigrationRunner, PGAdapter } from '@fonderie/store';
+import { PGAdapter } from '@fonderie/store';
 import { AuthModule, purgeSoftDeletedUsers } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus } from './notifications.js';
 import { explainDrainFailure, purgeEvents } from '@fonderie/events';
@@ -29,7 +29,7 @@ import {
 import { registerTaskRoutes } from './tasks/routes.js';
 import { PLANS, CREDIT_PACKS, WALLET_CURRENCY, WALLET_PRECISION } from './billing/catalog.js';
 import { MIGRATION_STEPS } from './db/migrations/steps.js';
-import { AdminModule, collectChecks, runDoctor } from '@fonderie/admin';
+import { AdminModule, collectChecks, migrationsCheck, runDoctor } from '@fonderie/admin';
 import { ConfigModule, createAesGcmEncryptor } from '@fonderie/config';
 import { RiskEngine, DEFAULT_RULESETS, TRIAL_START_RULESET } from '@fonderie/risk';
 import { geoFromHeaders } from '@fonderie/geo';
@@ -248,7 +248,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// post-deploy probe and to anyone who curls it.
 				readyProbe: async () => {
 					if (!(await store.testConnection())) return false;
-					return (await migrationsCheck.run()).ok;
+					return (await appMigrationsCheck.run()).ok;
 				},
 			}),
 		).register(
@@ -434,24 +434,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// Defined once and handed to both consumers: the dashboard's
 		// /_admin/doctor and the cron below. Two copies would drift, and the
 		// operator would be told one thing by the page and another by the log.
-		const migrationsCheck = {
-			name: 'app.migrations',
-			run: async () => {
-				const per = await Promise.all(
-					MIGRATION_STEPS.map(async ([name, path]) => {
-						const files = await new InternalMigrationRunner(store, path).pending();
-						return { name, files };
-					}),
-				);
-				const behind = per.filter((x) => x.files.length > 0);
-				return {
-					ok: behind.length === 0,
-					findings: behind.map(
-						(x) => `${x.name}: ${x.files.length} migration(s) not applied — ${x.files.join(', ')}`,
-					),
-				};
-			},
-		};
+		const appMigrationsCheck = migrationsCheck(store, MIGRATION_STEPS);
 
 		// Money that outlived its account. Billing cancels a subscription when
 		// its user is deleted (fonderie.user.deleted, @fonderie/billing ≥ the
@@ -533,7 +516,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 					'CONFIG_SECRET_KEY',
 					'TRIAL_MARKET_COUNTRIES',
 				],
-				checks: [migrationsCheck, deletedAccountsBillingCheck],
+				checks: [appMigrationsCheck, deletedAccountsBillingCheck],
 				// The SAME constant migrate.ts applies, so the panel can never
 				// offer an order the applier would not run — and the reporter
 				// above and the applier here cannot disagree about what exists.
@@ -550,7 +533,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// The same checks the /_admin/doctor page serves, for the cron below to
 		// run and LOG. collectChecks reads every registered module's description,
 		// so a brick added later is covered without touching this file.
-		const adminChecks = collectChecks(fonderie, [migrationsCheck, deletedAccountsBillingCheck]);
+		const adminChecks = collectChecks(fonderie, [appMigrationsCheck, deletedAccountsBillingCheck]);
 
 		// The catalog declares a price AND Stripe holds one, and which of the two
 		// the customer actually pays depends on the purchase path: hosted checkout
