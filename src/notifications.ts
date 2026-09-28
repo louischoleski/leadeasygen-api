@@ -35,8 +35,21 @@ export function createNotifyBus(
 ): { module: EventsModule; transport: PGTransport } {
 	// The transport comes back too: deadLetters()/pendingCount() live on it, and
 	// a queue nobody inspects is one that can stop delivering unnoticed.
-	const transport = new PGTransport({ connectionUrl, consume: options.consume });
+	const transport = new PGTransport({ connectionUrl, consume: options.consume, ...integrity() });
 	return { module: new EventsModule({ transport }), transport };
+}
+
+/**
+ * The event log doubles as the audit trail. With EVENTS_INTEGRITY_KEY every row
+ * this process publishes carries a keyed HMAC, so an edited row is detectable
+ * (doctor: events.integrity). EVERY publisher must use the same key — the API
+ * on Vercel and the worker on Cloud Run both read it from the same secret
+ * (Secret Manager `leadeasygen-events-integrity-key`, the retrievable copy).
+ * Unset: rows are unsigned, which the doctor reports rather than refuses.
+ */
+export function integrity(): { integrityKey?: string } {
+	const key = process.env.EVENTS_INTEGRITY_KEY;
+	return key ? { integrityKey: key } : {};
 }
 
 /** Whether transactional email is configured at all. */

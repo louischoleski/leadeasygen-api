@@ -131,7 +131,9 @@ COMMON=(
 	--region "$REGION"
 	--project "$PROJECT"
 	--set-env-vars "WORKER_ONCE=1,NODE_ENV=production"
-	--set-secrets "DATABASE_URL=leadeasygen-database-url:latest"
+	# The events HMAC key: the same secret the API holds in Vercel, so every row
+	# either process publishes verifies against one key.
+	--set-secrets "DATABASE_URL=leadeasygen-database-url:latest,EVENTS_INTEGRITY_KEY=leadeasygen-events-integrity-key:latest"
 	# Chromium needs the memory; at 512Mi the renderer is killed mid-scrape and
 	# the task is left in 'scraping' rather than failing cleanly.
 	--memory 2Gi

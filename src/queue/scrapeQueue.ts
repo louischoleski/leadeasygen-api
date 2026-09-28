@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { EventBus, PGTransport } from '@fonderie/events';
 import type { IStoreAdapter } from '@fonderie/store/types';
+import { integrity } from '../notifications.js';
 
 /**
  * Scrape job queue, built on Fonderie's durable Postgres-backed event bus
@@ -41,7 +42,12 @@ export function createScrapeBus(
 	// starting instantly. For a scrape measured in tens of seconds that is
 	// noise, and it buys a worker that deploys anywhere without a second secret.
 	return new EventBus(
-		new PGTransport({ connectionUrl, ...(options.consume === undefined ? {} : { consume: options.consume }) }),
+		new PGTransport({
+			connectionUrl,
+			...(options.consume === undefined ? {} : { consume: options.consume }),
+			// Same table, same audit trail as notifications: signed with the same key.
+			...integrity(),
+		}),
 	);
 }
 

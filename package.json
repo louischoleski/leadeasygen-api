@@ -28,7 +28,7 @@
 		"@fonderie/config": "^6.4.1",
 		"@fonderie/core": ">=0.22.0",
 		"@fonderie/courier": "^7.12.0",
-		"@fonderie/events": "^5.9.3",
+		"@fonderie/events": "^5.9.4",
 		"@fonderie/geo": "^0.5.2",
 		"@fonderie/media": "^0.2.21",
 		"@fonderie/rate-limit": "^4.0.24",
