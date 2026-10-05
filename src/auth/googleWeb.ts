@@ -131,8 +131,29 @@ export function registerGoogleRedirectRoutes(
       );
       const body = (await inner.json()) as {
         reason?: string;
+        explanation?: string;
+        details?: unknown;
         result?: { tokens?: { access: string; refresh: string } };
       };
+
+      // A sign-in to an account scheduled for deletion is not a failure: the
+      // person proved it is theirs and can keep it. Park the answer (dates +
+      // restore token) under a handoff code like tokens are, so the app can
+      // offer "Keep my account" instead of a dead-end "sign-in failed".
+      if (inner.status === 403 && body.reason === "ACCOUNT_PENDING_DELETION") {
+        const code = randomBytes(32).toString("hex");
+        await store.query(
+          `INSERT INTO oauth_handoff (code, payload, expires_at)
+			 VALUES ($1, $2, now() + make_interval(secs => $3))`,
+          [
+            code,
+            JSON.stringify({ refusal: { status: 403, reason: body.reason, explanation: body.explanation ?? "", details: body.details ?? null } }),
+            HANDOFF_TTL_SECONDS,
+          ],
+        );
+        res.append("Set-Cookie", "oauth_state=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
+        return res.redirect(302, `${frontendUrl}/auth/callback?code=${code}`);
+      }
 
       if (!inner.ok || !body.result?.tokens) {
         // Never surface the provider's raw text to the browser — it is not
@@ -201,7 +222,9 @@ export function registerGoogleExchangeRoute(
       // Single-use enforced by the UPDATE itself: a replay matches no row,
       // so two requests can never both receive the tokens.
       const [row] = await store.query<{
-        payload: { access: string; refresh: string };
+        payload:
+          | { access: string; refresh: string }
+          | { refusal: { status: number; reason: string; explanation: string; details: unknown } };
       }>(
         `UPDATE oauth_handoff
 			    SET used_at = now()
@@ -216,6 +239,12 @@ export function registerGoogleExchangeRoute(
             reason: "INVALID_CODE",
             explanation: "This sign-in link is no longer valid.",
           });
+      }
+      // A parked refusal (account scheduled for deletion) is answered as the
+      // sign-in answered it — same status, reason and details.
+      if ("refusal" in row.payload) {
+        const { status, reason, explanation, details } = row.payload.refusal;
+        return res.status(status).json({ reason, explanation, details });
       }
       return res.json({
         reason: "GOOGLE_AUTH_OK",
