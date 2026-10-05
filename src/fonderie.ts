@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { FonderieApp, defineConfig, installPlatformBackgroundRunner, isServerlessRuntime } from '@fonderie/core';
 import { PGAdapter } from '@fonderie/store';
 import { AuthModule, runAccountDeletionSchedule } from '@fonderie/auth';
+import type { IAccountEraser } from '@fonderie/auth';
 import { buildCourierModule, createNotifyBus, integrity } from './notifications.js';
 import { accountEraser as eventsAccountEraser, explainDrainFailure, purgeEvents } from '@fonderie/events';
 import { accountEraser as courierAccountEraser, messageStats } from '@fonderie/courier';
@@ -69,6 +70,9 @@ function jwtSecret(): string {
 
 export async function configureApp(options: ConfigureAppOptions) {
 	const { app, poolMax } = options;
+	// ONE eraser list for the daily schedule and the console's "erase now";
+	// filled once the bricks exist (below).
+	const accountErasers: IAccountEraser[] = [];
 
 	// Lets background work outlive the response on platforms that offer it
 	// (Vercel's waitUntil). Off such a platform this is a no-op.
@@ -271,7 +275,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 				{
 					jwtSecret: jwtSecret(),
 					appName: 'LeadEasyGen',
-					accountDeletion: { gracePeriodDays: userRetentionDays() },
+					accountDeletion: { gracePeriodDays: userRetentionDays(), erasers: accountErasers },
 					providers: googleOAuth ? ['email', 'google'] : ['email'],
 					...(googleOAuth ? { google: googleOAuth } : {}),
 					requireVerification: false,
@@ -380,6 +384,20 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// uploader-only DELETE /media/:id.
 		const media = new MediaModule(store, { provider: new DbBlobProvider(store) });
 		fonderieApp = fonderieApp.register(media);
+		// Every brick holding something of a person's, erased before the account
+		// row goes — billing (Stripe customer), avatar, message log, event payloads.
+		accountErasers.push(
+			billingAccountEraser(store, { provider: stripeProvider }),
+			media.accountEraser(),
+			courierAccountEraser(store),
+			eventsAccountEraser(store, {
+				...integrity(),
+				retiredIntegrityKeys: (process.env.EVENTS_INTEGRITY_RETIRED_KEYS ?? '')
+					.split(',')
+					.map((k) => k.trim())
+					.filter(Boolean),
+			}),
+		);
 
 		// Runtime configuration and secrets, editable from the console instead of
 		// through a redeploy. Until @fonderie/admin 1.0.0 this could not be
@@ -703,24 +721,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 				});
 				const usersPurged = await runAccountDeletionSchedule(
 					store,
-					{
-						jwtSecret: jwtSecret(),
-						accountDeletion: {
-							gracePeriodDays: userRetentionDays(),
-							erasers: [
-								billingAccountEraser(store, { provider: stripeProvider }),
-								media.accountEraser(),
-								courierAccountEraser(store),
-								eventsAccountEraser(store, {
-									...integrity(),
-									retiredIntegrityKeys: (process.env.EVENTS_INTEGRITY_RETIRED_KEYS ?? '')
-										.split(',')
-										.map((k) => k.trim())
-										.filter(Boolean),
-								}),
-							],
-						},
-					},
+					{ jwtSecret: jwtSecret(), accountDeletion: { gracePeriodDays: userRetentionDays(), erasers: accountErasers } },
 					notifyBus,
 				).catch((err) => {
 					console.error('[auth] account deletion schedule failed:', err);

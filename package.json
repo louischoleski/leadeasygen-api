@@ -22,8 +22,8 @@
 	},
 	"dependencies": {
 		"@fonderie/adapter-express": "^5.4.9",
-		"@fonderie/admin": "^1.7.12",
-		"@fonderie/auth": "^7.25.0",
+		"@fonderie/admin": "^1.8.0",
+		"@fonderie/auth": "^7.26.0",
 		"@fonderie/billing": "^10.10.0",
 		"@fonderie/config": "^6.6.7",
 		"@fonderie/core": ">=0.31.0",
