@@ -40,7 +40,7 @@ test("callerContext forwards the platform geolocation headers", () => {
 // "keep it?", not as a dead-end "sign-in failed": the refusal is parked under
 // the handoff code and the exchange answers with it.
 test("a pending-deletion refusal survives the handoff; tokens still do too", async () => {
-	const { registerGoogleRedirectRoutes, registerGoogleExchangeRoute } = await import("../googleWeb");
+	const { registerGoogleRedirectRoutes, registerGoogleExchangeRoute } = await import("../googleWeb.js");
 	const handoffs = new Map<string, unknown>();
 	const store = {
 		query: async (sql: string, params: unknown[]) => {
