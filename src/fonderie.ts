@@ -1,13 +1,14 @@
 import 'dotenv/config';
 import { FonderieApp, defineConfig, installPlatformBackgroundRunner, isServerlessRuntime } from '@fonderie/core';
 import { PGAdapter } from '@fonderie/store';
-import { AuthModule, purgeSoftDeletedUsers } from '@fonderie/auth';
-import { buildCourierModule, createNotifyBus } from './notifications.js';
-import { explainDrainFailure, purgeEvents } from '@fonderie/events';
-import { messageStats } from '@fonderie/courier';
+import { AuthModule, runAccountDeletionSchedule } from '@fonderie/auth';
+import { buildCourierModule, createNotifyBus, integrity } from './notifications.js';
+import { accountEraser as eventsAccountEraser, explainDrainFailure, purgeEvents } from '@fonderie/events';
+import { accountEraser as courierAccountEraser, messageStats } from '@fonderie/courier';
 import {
 	BillingModule,
 	StripeProvider,
+	accountEraser as billingAccountEraser,
 	SUPPORTED_PAYMENT_OPTIONS,
 	checkPriceConsistency,
 	describePriceProblems,
@@ -59,6 +60,11 @@ export interface ConfigureAppOptions {
 function userRetentionDays(): number {
 	const n = Number(process.env.USER_RETENTION_DAYS ?? 30);
 	return Number.isFinite(n) && n >= 0 ? n : 30;
+}
+
+// One secret for the auth module and the deletion schedule (restore links).
+function jwtSecret(): string {
+	return process.env.JWT_SECRET ?? 'dev-secret-change-me-min-32-chars-long';
 }
 
 export async function configureApp(options: ConfigureAppOptions) {
@@ -263,7 +269,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 			new AuthModule(
 				store,
 				{
-					jwtSecret: process.env.JWT_SECRET ?? 'dev-secret-change-me-min-32-chars-long',
+					jwtSecret: jwtSecret(),
 					appName: 'LeadEasyGen',
 					accountDeletion: { gracePeriodDays: userRetentionDays() },
 					providers: googleOAuth ? ['email', 'google'] : ['email'],
@@ -372,9 +378,8 @@ export async function configureApp(options: ConfigureAppOptions) {
 		// sniffed (SVG rejected = stored-XSS). Registers POST /media, PUBLIC
 		// cached GET /media/:id (an <img src> can't send a Bearer token), and
 		// uploader-only DELETE /media/:id.
-		fonderieApp = fonderieApp.register(
-			new MediaModule(store, { provider: new DbBlobProvider(store) }),
-		);
+		const media = new MediaModule(store, { provider: new DbBlobProvider(store) });
+		fonderieApp = fonderieApp.register(media);
 
 		// Runtime configuration and secrets, editable from the console instead of
 		// through a redeploy. Until @fonderie/admin 1.0.0 this could not be
@@ -685,17 +690,45 @@ export async function configureApp(options: ConfigureAppOptions) {
 					console.error('[auth:google] handoff purge failed:', err),
 				);
 
-				// Right-to-erasure follow-through: accounts soft-deleted more than
-				// USER_RETENTION_DAYS ago are hard-deleted. Each one is announced as
-				// fonderie.user.purged, which billing turns into deleting the Stripe
-				// customer (email + saved cards). The drain just below delivers it.
-				const usersPurged = await purgeSoftDeletedUsers(store, {
-					olderThanDays: userRetentionDays(),
-					bus: notifyBus,
-				}).catch((err) => {
-					console.error('[auth] user retention purge failed:', err);
+				// Right to erasure: a friendly reminder a week before the date to
+				// anyone who never came back, then each account archived more than
+				// USER_RETENTION_DAYS ago erased IN-PROCESS by every brick holding
+				// something of theirs before its row goes (Stripe customer, avatar,
+				// message log, event payloads), leaving a receipt with no personal
+				// data. A failing eraser keeps the account archived; the next tick
+				// retries. Drain FIRST: the events eraser refuses a person with mail
+				// still in the outbox, and with a daily tick that would cost a day.
+				await notifications.drain({ maxMs: 10_000 }).catch(() => {
+					// Reported by the drain below.
+				});
+				const usersPurged = await runAccountDeletionSchedule(
+					store,
+					{
+						jwtSecret: jwtSecret(),
+						accountDeletion: {
+							gracePeriodDays: userRetentionDays(),
+							erasers: [
+								billingAccountEraser(store, { provider: stripeProvider }),
+								media.accountEraser(),
+								courierAccountEraser(store),
+								eventsAccountEraser(store, {
+									...integrity(),
+									retiredIntegrityKeys: (process.env.EVENTS_INTEGRITY_RETIRED_KEYS ?? '')
+										.split(',')
+										.map((k) => k.trim())
+										.filter(Boolean),
+								}),
+							],
+						},
+					},
+					notifyBus,
+				).catch((err) => {
+					console.error('[auth] account deletion schedule failed:', err);
 					return null;
 				});
+				for (const f of usersPurged?.failed ?? []) {
+					console.error(`[auth] erasure of ${f.userId} failed at ${f.eraser}: ${f.error}`);
+				}
 
 				// The event log is also the audit trail, and it grew forever: nothing
 				// here ever disposed of it. EVENT_RETENTION_DAYS (default 365 — the
