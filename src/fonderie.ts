@@ -53,6 +53,14 @@ export interface ConfigureAppOptions {
  * Wire every module onto the given Express app. Never listens — `src/index.ts`
  * owns the app, exports it for Vercel, and starts a server only off-platform.
  */
+// How long a deleted account stays archived (and restorable) before the purge
+// erases it — ONE number for both: what sign-in tells the person ("deleted on
+// …") and when the cron actually purges it.
+function userRetentionDays(): number {
+	const n = Number(process.env.USER_RETENTION_DAYS ?? 30);
+	return Number.isFinite(n) && n >= 0 ? n : 30;
+}
+
 export async function configureApp(options: ConfigureAppOptions) {
 	const { app, poolMax } = options;
 
@@ -257,6 +265,7 @@ export async function configureApp(options: ConfigureAppOptions) {
 				{
 					jwtSecret: process.env.JWT_SECRET ?? 'dev-secret-change-me-min-32-chars-long',
 					appName: 'LeadEasyGen',
+					accountDeletion: { gracePeriodDays: userRetentionDays() },
 					providers: googleOAuth ? ['email', 'google'] : ['email'],
 					...(googleOAuth ? { google: googleOAuth } : {}),
 					requireVerification: false,
@@ -680,9 +689,8 @@ export async function configureApp(options: ConfigureAppOptions) {
 				// USER_RETENTION_DAYS ago are hard-deleted. Each one is announced as
 				// fonderie.user.purged, which billing turns into deleting the Stripe
 				// customer (email + saved cards). The drain just below delivers it.
-				const retentionDays = Number(process.env.USER_RETENTION_DAYS ?? 30);
 				const usersPurged = await purgeSoftDeletedUsers(store, {
-					olderThanDays: Number.isFinite(retentionDays) && retentionDays >= 0 ? retentionDays : 30,
+					olderThanDays: userRetentionDays(),
 					bus: notifyBus,
 				}).catch((err) => {
 					console.error('[auth] user retention purge failed:', err);
