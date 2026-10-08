@@ -35,7 +35,7 @@
 		"@fonderie/risk": "^0.3.10",
 		"@fonderie/storage": "^0.1.31",
 		"@fonderie/store": ">=0.7.2",
-		"@fonderie/workspaces": "^7.2.1",
+		"@fonderie/workspaces": "^7.3.0",
 		"@vercel/functions": "^3.9.7",
 		"axios": "^1.19.0",
 		"dotenv": "^17.4.2",
